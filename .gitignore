@@ -12,3 +12,14 @@ tgfm_data/
 *.jsonl
 *.log
 outputs/
+
+report/
+
+# latex build artifacts
+*.aux
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+*.bbl
+*.blg
