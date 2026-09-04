@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
+.vscode/
+.DS_Store
+
+# built datasets and run outputs live outside the repo (SHAPE_DATA_ROOT)
+tgfm_data/
+*.pt
+*.tpt
+*.jsonl
+*.log
+outputs/
