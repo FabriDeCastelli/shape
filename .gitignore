@@ -5,14 +5,19 @@ __pycache__/
 .vscode/
 .DS_Store
 
-# built datasets and run outputs live outside the repo (SHAPE_DATA_ROOT)
-tgfm_data/
+# datasets live outside the repo (SHAPE_DATA_ROOT)
 *.pt
 *.tpt
+
+# run outputs
+runs/
+logs/
+checkpoints/
+outputs/
 *.jsonl
 *.log
-outputs/
 
+# paper sources are kept on Overleaf
 report/
 
 # latex build artifacts
@@ -23,3 +28,4 @@ report/
 *.synctex.gz
 *.bbl
 *.blg
+/.jobs.lock

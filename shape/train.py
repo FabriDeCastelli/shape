@@ -11,27 +11,85 @@ fold decides which *nodes* contribute to the loss and the score.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import logging
 import math
 import os
+import tempfile
 import time
+import warnings
 from typing import Dict, List, Optional
 
+import lightning as L
 import torch
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+from torch.utils.data import DataLoader, Subset
 
-from shape.data import DatasetCard, ShapeDataset
+from shape.data import DatasetCard, ShapeDataset, densify_union
 from shape.model import Shape, loss_for
+from shape.relations import physical_adjacency
+
+# One summary line per dataset is the whole output contract; Lightning's INFO
+# banner would put an accelerator report between every seed, and its
+# worker-count nag is noise when a corpus is small enough not to need them.
+logging.getLogger("lightning.pytorch").setLevel(logging.WARNING)
+warnings.filterwarnings("ignore", ".*does not have many workers.*")
+
+# Lightning maps these to torch.autocast(device, dtype=..., cache_enabled=False)
+# and refuses a GradScaler for bf16 -- bf16 carries fp32's 8-bit exponent, so
+# gradients do not underflow the way fp16's [-14,15] range makes them
+# (Kalamkar et al. 2019; Micikevicius et al. 2017 sec. 3.2). No scaler anywhere.
+PRECISION = {"bf16": "bf16-mixed", "fp32": "32-true"}
 
 
-def stack(ds: ShapeDataset, idx: List[int], device: str):
-    """A batch of samples as ``[B,N,W,C]`` plus targets and validity."""
-    items = [ds[i] for i in idx]
-    x = torch.stack([it["x"] for it in items]).to(device)
-    y = torch.stack([it["y"] for it in items]).to(device)
-    m = None
+def configure_backends(precision: str) -> None:
+    """Matmul precision policy. Must run before any CUDA work.
+
+    A bf16 tensor-core GEMM accumulates into fp32, but cuBLAS may split one
+    reduction across thread blocks and combine the partials in bf16. Forcing that
+    combine to fp32 is what makes the dot product fp32-accumulated in the sense
+    Micikevicius et al. 2017 sec. 3 requires, so it is set rather than assumed.
+
+    TF32 follows the flag instead of being enabled globally. In fp32 mode this
+    run is the accuracy reference the bf16 path gets compared against, and TF32
+    would quietly make that reference 10-bit-mantissa -- the comparison would
+    then understate any bf16 regression. In bf16 mode autocast already routes
+    every large matmul to bf16, so TF32 only reaches the few fp32 matmuls that
+    escape it, where the speed is free. (No convolutions exist in this model, so
+    the cudnn flag is set only to keep the two consistent.)
+    """
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    use_tf32 = precision == "bf16"
+    torch.backends.cuda.matmul.allow_tf32 = use_tf32
+    torch.backends.cudnn.allow_tf32 = use_tf32
+
+
+def collate(items: List[Dict]) -> Dict:
+    """A batch of samples as ``[B,N,W,C]`` plus targets, covariates and validity."""
+    out = {"y": torch.stack([it["y"] for it in items]),          # [B, N, H] or [B]
+           "u": torch.stack([it["u"] for it in items]),          # [B, W, 8]
+           "u_mask": torch.stack([it["u_mask"] for it in items]),  # [B, W, 8]
+           "pe": None if items[0].get("pe") is None
+                 else torch.stack([it["pe"] for it in items]),   # [B, N, 16]  (dense path)
+           "mask": None,
+           "num_nodes": None,
+           "deg": None if items[0]["deg"] is None else torch.stack([it["deg"] for it in items]),
+           # Ragged: snapshots in a window have different edge counts, so the
+           # topology stays a list and is densified only if a relation wants it.
+           "edge_index": None if items[0].get("edge_index") is None
+                         else [it["edge_index"] for it in items],
+           "edge_weight": None if items[0].get("edge_weight") is None
+                          else [it["edge_weight"] for it in items]}
+    # A probe-only corpus yields only its active nodes, which differ per sample.
+    compact = densify_union(items)
+    if compact is not None:
+        out["x"], out["node_ids"], out["num_nodes"], out["pe"] = compact   # [B, K, W, C]
+    else:
+        out["x"] = torch.stack([it["x"] for it in items])       # [B, N, W, C]
     if items[0]["mask"] is not None:
-        m = torch.stack([it["mask"] for it in items]).to(device)
-    return x, y, m
+        out["mask"] = torch.stack([it["mask"] for it in items])
+    return out
 
 
 def metrics_for(card: DatasetCard, pred: torch.Tensor, y: torch.Tensor,
@@ -48,12 +106,28 @@ def metrics_for(card: DatasetCard, pred: torch.Tensor, y: torch.Tensor,
     if card.metric == "mse":
         return {"MSE": float(((pred - y.view_as(pred)) ** 2).mean())}
     if card.metric == "masked_mae":
-        p, t = pred.reshape(-1), y.view_as(pred).reshape(-1)
-        keep = t != 0 if mask is None else (mask.reshape(-1) & (t != 0))
-        p, t = p[keep], t[keep]
-        err = (p - t).abs()
-        return {"MAE": float(err.mean()), "RMSE": float(err.pow(2).mean().sqrt()),
-                "MAPE": float((err / t.abs()).mean() * 100)}
+        y = y.view_as(pred)
+
+        def score(p, t, m):
+            keep = (t != 0) if m is None else (m & (t != 0))
+            p, t = p[keep], t[keep]
+            e = (p - t).abs()
+            return (float(e.mean()), float(e.pow(2).mean().sqrt()),
+                    float((e / t.abs()).mean() * 100))
+
+        mae, rmse, mape = score(pred.reshape(-1), y.reshape(-1),
+                                None if mask is None else mask.reshape(-1))
+        out = {"MAE": mae, "RMSE": rmse, "MAPE": mape}
+        # TIDES' Table 2 averages over horizons; its Table 12 (Metr-LA, PeMS-Bay)
+        # reports step 12 alone, as does most of the traffic literature. Both are
+        # emitted so a comparison names which one it uses.
+        for h in (3, 6, 12):
+            if pred.shape[-1] < h:
+                continue
+            mh = None if mask is None else mask[..., h - 1].reshape(-1)
+            a, r, p_ = score(pred[..., h - 1].reshape(-1), y[..., h - 1].reshape(-1), mh)
+            out[f"MAE@{h}"], out[f"RMSE@{h}"], out[f"MAPE@{h}"] = a, r, p_
+        return out
     if card.metric == "accuracy":
         from sklearn.metrics import f1_score
         pl = pred.reshape(-1, card.num_classes).argmax(-1).cpu().numpy()
@@ -69,78 +143,189 @@ def metrics_for(card: DatasetCard, pred: torch.Tensor, y: torch.Tensor,
     raise ValueError(card.metric)
 
 
-def node_fold(ds: ShapeDataset, fold: str, device: str) -> Optional[torch.Tensor]:
-    """Which nodes count for this fold, or None when the split is temporal."""
-    if ds.card.split_kind != "node":
-        return None
-    return ds.splits[fold].to(device).bool()
+class ShapeTask(L.LightningModule):
+    """The model, its loss, and the card's metric over a whole fold.
+
+    ``node_masks`` is per-fold and non-None only for a transductive split, where
+    it says which nodes count towards the loss and the score.
+    """
+
+    def __init__(self, card: DatasetCard, node_masks: Dict[str, Optional[torch.Tensor]],
+                 lr: float, weight_decay: float, hidden: int, layers: int,
+                 use_covariates: bool, eval_chunk: int = 0, fuse: str = "mean",
+                 relations: str = "legacy", phys_adj=None, use_scale: bool = False,
+                 scale_shared: bool = False, patch_len: int = 0,
+                 attn_depth: int = 0, rel_gate: bool = False, rel_inject: bool = False,
+                 covariate_readout: bool = False):
+        super().__init__()
+        self.card = card
+        self.node_masks = node_masks
+        self.lr, self.weight_decay = lr, weight_decay
+        self.model = Shape([card], hidden_dim=hidden, num_layers=layers,
+                           use_covariates=use_covariates, eval_chunk=eval_chunk, fuse=fuse,
+                           relations=relations, phys_adj=phys_adj, use_scale=use_scale,
+                           scale_shared=scale_shared, patch_len=patch_len,
+                           attn_depth=attn_depth, rel_gate=rel_gate, rel_inject=rel_inject,
+                           covariate_readout=covariate_readout)
+        self.test_out: List[Dict] = []
+
+    def step(self, batch, fold: str):
+        pred = self.model(batch["x"], edge_index=batch.get("edge_index"),
+                          edge_weight=batch.get("edge_weight"),
+                          u=batch["u"], u_mask=batch["u_mask"], card=self.card,
+                          num_nodes=batch.get("num_nodes"), deg=batch.get("deg"))
+        y = batch["y"]
+        nodes = self.node_masks[fold]
+        if nodes is not None:                 # transductive: score only this fold's nodes
+            pred, y = pred[:, nodes], y[:, nodes]
+        return pred, y, loss_for(self.card, pred, y, batch["mask"])
+
+    def training_step(self, batch, _):
+        _, _, loss = self.step(batch, "train")
+        self.log("train_loss", loss, batch_size=batch["x"].shape[0])
+        return loss
+
+    def validation_step(self, batch, _):
+        _, _, loss = self.step(batch, "val")
+        self.log("val_loss", loss, batch_size=batch["x"].shape[0])
+
+    def test_step(self, batch, _):
+        pred, y, _ = self.step(batch, "test")
+        # The metrics are set-level -- F1, AUC, and a masked MAE over non-zero
+        # targets -- so the fold is concatenated and scored once, never averaged
+        # per batch.
+        self.test_out.append({"pred": pred.float().cpu(), "y": y.cpu(),
+                              "mask": None if batch["mask"] is None else batch["mask"].cpu()})
+
+    def on_test_epoch_end(self):
+        cat = lambda k: torch.cat([o[k] for o in self.test_out])
+        mask = None if self.test_out[0]["mask"] is None else cat("mask")
+        self.metrics = metrics_for(self.card, cat("pred"), cat("y"), mask)
+        self.test_out.clear()
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
 
-def run_epoch(model, ds, card, sample_idx, node_mask, opt, device, batch_size, train: bool):
-    model.train(train)
-    total, seen, preds, ys, masks = 0.0, 0, [], [], []
-    for s in range(0, len(sample_idx), batch_size):
-        idx = sample_idx[s:s + batch_size]
-        x, y, m = stack(ds, idx, device)
-        b_u = ds.u[idx].to(device) if ds.u is not None else None
-        b_um = ds.u_mask[idx].to(device) if ds.u_mask is not None else None
-        with torch.set_grad_enabled(train):
-            pred = model(x, u=b_u, u_mask=b_um, card=card)
-            if node_mask is not None:              # transductive: score only this fold's nodes
-                pred, y = pred[:, node_mask], y[:, node_mask]
-            loss = loss_for(card, pred, y, m)
-        if train:
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step()
-        else:
-            preds.append(pred.detach().cpu())
-            ys.append(y.detach().cpu())
-            masks.append(None if m is None else m.detach().cpu())
-        total += float(loss) * len(idx)
-        seen += len(idx)
-    if train:
-        return total / max(seen, 1), None
-    cat_m = None if masks[0] is None else torch.cat(masks)
-    return total / max(seen, 1), metrics_for(card, torch.cat(preds), torch.cat(ys), cat_m)
+def loaders(ds: ShapeDataset, batch_size: int, eval_batch_size: int = 0,
+            shuffle: bool = False, seed: int = 0, num_workers: int = 0):
+    """One loader per fold, plus the node mask each fold scores on.
 
-
-def train_one(name: str, seed: int, epochs: int, batch_size: int, lr: float,
-              patience: int, device: str, hidden: int, layers: int,
-              use_covariates: bool = False, weight_decay: float = 0.0) -> Dict:
-    torch.manual_seed(seed)
-    ds = ShapeDataset(name)
-    card = ds.card
-    model = Shape([card], hidden_dim=hidden, num_layers=layers,
-                     use_covariates=use_covariates).to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-
-
-    if card.split_kind == "temporal":
+    A temporal split gives each fold its own time samples. A node split is
+    transductive: every fold walks every sample and differs only in its mask.
+    """
+    if ds.card.split_kind == "temporal":
         folds = {k: ds.splits[k].tolist() for k in ("train", "val", "test")}
         nodes = {k: None for k in folds}
     else:
         every = list(range(len(ds)))
         folds = {k: every for k in ("train", "val", "test")}
-        nodes = {k: node_fold(ds, k, device) for k in folds}
+        nodes = {k: ds.splits[k].bool() for k in folds}
+    # A DataLoader iterator draws a worker base seed from the global RNG every
+    # epoch. With num_workers=0 that seed is never used, but the draw would still
+    # shift the stream the model's dropout runs on. A private generator keeps the
+    # global stream reserved for the model.
+    # The node budget caps the graph while training but not while evaluating, so
+    # a batch that fits in training can still OOM on the full eligible set.
+    bs = {k: (batch_size if k == "train" else (eval_batch_size or batch_size)) for k in folds}
+    # Only the train fold may be shuffled: val/test metrics are set-level and are
+    # concatenated before scoring, so their order is irrelevant either way.
+    # Windowing happens in __getitem__, so with the default num_workers=0 every
+    # batch is cut synchronously in the main process while the device idles. The
+    # sampler and its generator decide batch composition, so workers change only
+    # who does the cutting: results are unaffected. persistent_workers matters
+    # here because epochs are short and respawning would dominate them.
+    kw = {}
+    if num_workers:
+        kw = dict(num_workers=num_workers, persistent_workers=True,
+                  prefetch_factor=4, pin_memory=True)
+    dl = {k: DataLoader(Subset(ds, idx), batch_size=bs[k], shuffle=(shuffle and k == "train"),
+                        collate_fn=collate, generator=torch.Generator().manual_seed(seed), **kw)
+          for k, idx in folds.items()}
+    return dl, nodes
 
-    best, best_state, bad, t0 = math.inf, None, 0, time.time()
-    for ep in range(epochs):
-        run_epoch(model, ds, card, folds["train"], nodes["train"], opt, device, batch_size, True)
-        vloss, _ = run_epoch(model, ds, card, folds["val"], nodes["val"], opt, device, batch_size, False)
-        if vloss < best - 1e-6:
-            best, bad = vloss, 0
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        else:
-            bad += 1
-            if bad >= patience:
-                break
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    _, test = run_epoch(model, ds, card, folds["test"], nodes["test"], opt, device, batch_size, False)
-    return {"dataset": name, "seed": seed, "metric": card.metric, "epochs": ep + 1,
-            "val_loss": best, "seconds": round(time.time() - t0, 1), **test}
+
+def train_one(name: str, seed: int, epochs: int, batch_size: int, lr: float,
+              patience: int, device: str, hidden: int, layers: int,
+              use_covariates: bool = False, weight_decay: float = 0.0,
+              precision: str = "bf16", eval_chunk: int = 0,
+              eval_batch_size: int = 0, fuse: str = "mean",
+              shuffle: bool = False, ckpt_dir: Optional[str] = None,
+              limit_train_batches: int = 0, relations: str = "legacy",
+              phys_weight: str = "binary", use_scale: bool = False,
+              scale_shared: bool = False, patch_len: int = 0,
+              attn_depth: int = 0, rel_gate: bool = False,
+              rel_inject: bool = False, covariate_readout: bool = False,
+              num_workers: int = 0) -> Dict:
+    configure_backends(precision)
+    L.seed_everything(seed, workers=True, verbose=False)
+    ds = ShapeDataset(name)
+    card = ds.card
+    dl, nodes = loaders(ds, batch_size, eval_batch_size, shuffle, seed, num_workers)
+    # The physical graph is a constant of the corpus (static_topology), so it is
+    # built once here rather than travelling with every batch.
+    phys_adj = None
+    if "phys" in relations:
+        if not card.static_topology:
+            raise SystemExit(f"{name}: relations={relations!r} needs a static topology")
+        ei, ew = ds._edges_at(0)
+        adj = physical_adjacency(ei, ew, card.num_nodes, phys_weight)
+        if adj is None:
+            raise SystemExit(f"{name}: no physical edges to build a relation from")
+        phys_adj = {card.name: adj}
+    task = ShapeTask(card, nodes, lr, weight_decay, hidden, layers, use_covariates,
+                     eval_chunk, fuse, relations, phys_adj, use_scale, scale_shared,
+                     patch_len, attn_depth, rel_gate, rel_inject, covariate_readout)
+
+    accelerator, devices = ("cpu", 1) if device == "cpu" else ("gpu", [int(device.split(":")[1])])
+    if device != "cpu" and torch.cuda.is_available():
+        # reset_peak_memory_stats needs an initialised context on that device
+        torch.cuda.set_device(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    t0 = time.time()
+    # The best epoch is scored and then thrown away unless a directory is named.
+    # Phases that freeze a trained backbone need the weights to outlive the run.
+    keep = ckpt_dir is not None
+    if keep:
+        os.makedirs(ckpt_dir, exist_ok=True)
+    with (contextlib.nullcontext(ckpt_dir) if keep else tempfile.TemporaryDirectory()) as d:
+        best = ModelCheckpoint(dirpath=d, monitor="val_loss", mode="min", save_top_k=1,
+                               filename=f"{name}-seed{seed}", enable_version_counter=False)
+        trainer = L.Trainer(
+            max_epochs=epochs, accelerator=accelerator, devices=devices,
+            precision=PRECISION[precision],
+            # Caps the per-epoch training budget so a single-dataset run can be
+            # given exactly the exposure a joint run gives one corpus.
+            limit_train_batches=limit_train_batches or 1.0,
+            gradient_clip_val=5.0, num_sanity_val_steps=0,
+            callbacks=[EarlyStopping("val_loss", min_delta=1e-6, patience=patience, mode="min"), best],
+            logger=False, enable_progress_bar=False, enable_model_summary=False,
+        )
+        trainer.fit(task, dl["train"], dl["val"])
+        # Score the best epoch, not the last one the stopper happened to reach.
+        trainer.test(task, dl["test"], ckpt_path=best.best_model_path, verbose=False)
+        val_loss = float(best.best_model_score) if best.best_model_score is not None else math.inf
+
+    return {"dataset": name, "seed": seed, "metric": card.metric,
+            "epochs": trainer.current_epoch,
+            "hidden": hidden, "layers": layers, "lr": lr, "weight_decay": weight_decay,
+            "covariates": use_covariates, "revin": task.model.revin, "batch_size": batch_size,
+            "precision": precision, "fuse": fuse, "shuffle": shuffle,
+            "limit_train_batches": limit_train_batches,
+            "relations": relations, "phys_weight": phys_weight, "scale": use_scale,
+            "scale_shared": scale_shared, "patch_len": patch_len,
+            "attn_depth": attn_depth, "rel_gate": rel_gate, "rel_inject": rel_inject,
+            "covariate_readout": covariate_readout,
+            "checkpoint": best.best_model_path if keep else None,
+            "val_loss": val_loss, "seconds": round(time.time() - t0, 1),
+            "peak_mem_mb": _peak_mem_mb(device), **task.metrics}
+
+
+def _peak_mem_mb(device: str) -> float:
+    """Peak allocated CUDA memory for this run, 0.0 on CPU."""
+    if device == "cpu" or not torch.cuda.is_available():
+        return 0.0
+    return round(torch.cuda.max_memory_allocated(device) / 2 ** 20, 1)
 
 
 if __name__ == "__main__":
@@ -155,7 +340,48 @@ if __name__ == "__main__":
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--covariates", action="store_true")
+    ap.add_argument("--attn-depth", type=int, default=0,
+                    help="causal self-attention layers over the patch sequence; "
+                         "0 = the order-free pooled encoder. Needs --patch-len")
+    ap.add_argument("--rel-gate", action="store_true",
+                    help="gate the aggregated message per node and channel")
+    ap.add_argument("--rel-inject", action="store_true",
+                    help="re-inject f(X) at every propagation layer")
+    ap.add_argument("--num-workers", type=int, default=0,
+                    help="dataloader workers; windowing happens in __getitem__, so 0 "
+                         "cuts every batch in the main process while the device waits")
+    ap.add_argument("--covariate-readout", action="store_true",
+                    help="FiLM the final representation on the calendar covariates, "
+                         "after propagation rather than before it")
     ap.add_argument("--weight-decay", type=float, default=0.0)
+    ap.add_argument("--precision", choices=list(PRECISION), default="bf16",
+                    help="bf16 mixed precision (default) or a strict fp32 reference run")
+    ap.add_argument("--eval-chunk", type=int, default=0,
+                    help="split the eval Gram into blocks of this many nodes "
+                         "(block-diagonal approximation; needed for ArXiv)")
+    ap.add_argument("--eval-batch-size", type=int, default=0,
+                    help="batch size for val/test; defaults to --batch-size")
+    ap.add_argument("--fuse", choices=["mean", "attn"], default="mean",
+                    help="how per-source node embeddings combine: unweighted "
+                         "mean (original) or a learned query over source tokens")
+    ap.add_argument("--patch-len", type=int, default=0,
+                    help="patch the input window instead of a flat Linear(W,.); 0 = off")
+    ap.add_argument("--scale-shared", action="store_true",
+                    help="one [mu,sigma] projection for every corpus; required for zero-shot")
+    ap.add_argument("--scale", action="store_true",
+                    help="add projected per-window [mean, std] as a source (Phi_scale)")
+    ap.add_argument("--relations", default="legacy",
+                    help="legacy (the pre-Phase-03 inline Gram loop), or a '+'-joined "
+                         "subset of {gram,phys} routed through independent blocks")
+    ap.add_argument("--phys-weight", choices=["binary", "gaussian"], default="binary",
+                    help="edge weighting for the physical relation; the stored weight "
+                         "is a road distance, so 'gaussian' turns it into a similarity")
+    ap.add_argument("--limit-train-batches", type=int, default=0,
+                    help="train on at most this many batches per epoch (0 = all)")
+    ap.add_argument("--ckpt-dir", default=None,
+                    help="keep the best-epoch checkpoint here instead of discarding it")
+    ap.add_argument("--shuffle", action="store_true",
+                    help="shuffle the train fold (TIDES does; SHAPE historically did not)")
     ap.add_argument("--out", default=None, help="append results as JSON lines")
     a = ap.parse_args()
 
@@ -163,12 +389,28 @@ if __name__ == "__main__":
         rows = []
         for seed in a.seeds:
             r = train_one(name, seed, a.epochs, a.batch_size, a.lr, a.patience,
-                          a.device, a.hidden, a.layers, a.covariates, a.weight_decay)
+                          a.device, a.hidden, a.layers, a.covariates, a.weight_decay,
+                          a.precision, a.eval_chunk, a.eval_batch_size, a.fuse, a.shuffle,
+                          a.ckpt_dir, a.limit_train_batches, a.relations, a.phys_weight, a.scale,
+                          a.scale_shared, a.patch_len,
+                          attn_depth=a.attn_depth, rel_gate=a.rel_gate,
+                          rel_inject=a.rel_inject,
+                          covariate_readout=a.covariate_readout,
+                          num_workers=a.num_workers)
             rows.append(r)
             if a.out:
+                # A run that finished should never lose its row to a missing
+                # directory: the write happens after training, so the cost of
+                # the failure is the whole run.
+                os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
                 with open(a.out, "a") as fh:
                     fh.write(json.dumps(r) + "\n")
-        keys = [k for k in rows[0] if k not in ("dataset", "seed", "metric", "epochs", "val_loss", "seconds")]
+        keys = [k for k in rows[0] if k not in ("dataset", "seed", "metric", "epochs",
+                                               "val_loss", "seconds", "precision", "fuse",
+                                               "shuffle", "checkpoint",
+                                               "limit_train_batches", "relations",
+                                               "phys_weight", "scale")
+                and isinstance(rows[0][k], (int, float)) and not isinstance(rows[0][k], bool)]
         summary = "  ".join(
             f"{k} {sum(r[k] for r in rows) / len(rows):.4f}"
             f"±{(sum((r[k] - sum(q[k] for q in rows) / len(rows)) ** 2 for r in rows) / len(rows)) ** 0.5:.4f}"
