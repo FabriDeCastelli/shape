@@ -21,7 +21,7 @@ import torch
 
 # Processed datasets + their cards.
 SHAPE_DATA_ROOT = os.path.abspath(
-    os.environ.get("SHAPE_DATA_ROOT", os.path.join(os.path.dirname(__file__), "..", "..", "..", "tgfm_data"))
+    os.environ.get("SHAPE_DATA_ROOT", os.path.join(os.path.dirname(__file__), "..", "data"))
 )
 
 W_DEFAULT = 12
@@ -325,7 +325,6 @@ class ShapeDataset:
                     "deg": self.degree_features(t, W),   # graph-classify by construction
                     "edge_index": ei, "edge_weight": ew,
                     "u": self.u[i], "u_mask": self.u_mask[i],
-                    "x_tsfm": None,
                     "pe": None if self._pe_dir is None
                           else load_pe(self._pe_dir, t)[nodes],
                     "mask": None if self.mask is None else self.mask[t],
@@ -345,7 +344,9 @@ class ShapeDataset:
             parts.append(trace)                                          # [N, W, probe_dim]
         if self.static is not None:
             parts.append(self.static.unsqueeze(1).expand(-1, W, -1))     # [N, W, D_static]
-        x = torch.cat(parts, dim=-1)                                     # [N, W, C]
+        # One source is the common case (a real series, or the probe alone), and
+        # torch.cat copies even a one-element list.
+        x = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)    # [N, W, C]
 
         ei, ew = self._edges_at(t)
         return {
@@ -357,7 +358,6 @@ class ShapeDataset:
             "edge_weight": ew,
             "u": self.u[i],
             "u_mask": self.u_mask[i],
-            "x_tsfm": None,      # produced by a later stage; the slot is fixed now
             "pe": None if self._pe_dir is None else load_pe(self._pe_dir, t),
             "mask": None if self.mask is None else self.mask[t],
             "y": self.y[t],
@@ -441,7 +441,7 @@ def _self_check() -> None:
         b = ds[0]
         assert b["x"].shape == (N, W, card.C), b["x"].shape
         assert b["u"].shape == (W, 8) and b["u_mask"].shape == (W, 8)
-        assert b["x_tsfm"] is None and b["pe"] is None
+        assert b["pe"] is None
         # The static block must be constant across the window; the probe must not be.
         s = slice(*groups["static"])
         assert (b["x"][:, 0, s] == b["x"][:, -1, s]).all(), "static channels must not vary in time"

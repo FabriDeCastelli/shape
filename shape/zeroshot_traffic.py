@@ -4,8 +4,8 @@ The forecast head is shared across corpora (``head_key`` returns the task), and
 channel indices are derived for an unseen card, so a joint checkpoint can be run
 forward on a held-out corpus with no new parameters. The one exception is
 Phi_scale: a per-corpus projection has no entry for an unseen corpus and is
-silently skipped, which is why ``scale_shared`` exists. Whether the source was
-actually active is recorded per run rather than assumed.
+and no per-corpus parameter remains, so a joint checkpoint runs forward on an
+unseen corpus with no new weights at all.
 
 No gradient touches the target. The target's *test* fold is scored, so the number
 is comparable with the supervised column trained on the same split.
@@ -23,9 +23,24 @@ from torch.utils.data import DataLoader
 
 from shape.data import ShapeDataset
 from shape.model import Shape, head_key
-from shape.relations import physical_adjacency
 from shape.pretrain import BalancedBatchSampler, MultiCorpus, collate_pack
 from shape.train import configure_backends, metrics_for
+
+
+def _remap_legacy_heads(sd: Dict, cards) -> Dict:
+    """Rename ``heads.forecast.*`` to the horizon-specific key.
+
+    Forecast heads used to be shared across every horizon under one key. They are
+    now keyed by horizon, so a checkpoint written before that change carries
+    ``heads.forecast.*`` and would silently lose its head on a non-strict load.
+    Only forecasting corpora are affected, and all of them had H=12.
+    """
+    hs = {c.H for c in cards if c.task == "forecast"}
+    if len(hs) != 1 or not any(k.startswith("heads.forecast.") for k in sd):
+        return sd
+    h = hs.pop()
+    return {(f"heads.forecast-{h}." + k[len("heads.forecast."):]
+             if k.startswith("heads.forecast.") else k): v for k, v in sd.items()}
 
 
 def build_model(meta: Dict, device: str, target: str = None) -> Shape:
@@ -39,47 +54,28 @@ def build_model(meta: Dict, device: str, target: str = None) -> Shape:
     ``missing_keys`` alone does not catch this, because nothing is missing.
     """
     cards = [ShapeDataset(n).card for n in meta["corpora"]]
-    # The phys relation reads a per-corpus buffer registered at training time, so a
-    # held-out corpus resolves to None and the branch contributes zeros -- the model
-    # is scored missing an input it was trained to expect, which reads as "the given
-    # graph does not transfer" when it only means the graph was never loaded.
-    # Topology ships with the corpus and is not learned, so supplying the target's
-    # own adjacency is still zero-shot: no target labels and no target training data.
-    tgt_card = None
-    if target is not None and target not in meta["corpora"]:
-        tds = ShapeDataset(target)
-        if tds.card.static_topology:
-            tgt_card = tds.card
     sd = torch.load(meta["checkpoint"], map_location="cpu", weights_only=False)["state_dict"]
     sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
-    # The per-corpus adjacencies ride in the checkpoint; rebuild them from it
-    # rather than re-deriving, so the buffers match what was trained on.
-    phys = {k[len("phys_"):]: v for k, v in sd.items() if k.startswith("phys_")}
-    if tgt_card is not None and phys:
-        phys[target] = physical_adjacency(*ShapeDataset(target)._edges_at(0),
-                                          tgt_card.num_nodes, meta.get("phys_weight", "binary"))
-        cards = cards + [tgt_card]
+    sd = _remap_legacy_heads(sd, cards)
     model = Shape(cards, hidden_dim=meta["hidden"], num_layers=meta["layers"],
-                  relations=meta.get("relations", "legacy"),
-                  use_scale=bool(meta.get("scale")),
-                  scale_shared=bool(meta.get("scale_shared")),
+                  relations=meta["relations"],
                   patch_len=int(meta.get("patch_len") or 0),
                   attn_depth=int(meta.get("attn_depth") or 0),
                   rel_gate=bool(meta.get("rel_gate")),
-                  rel_inject=bool(meta.get("rel_inject")),
-                  soft_topk=bool(meta.get("soft_topk")),
+                  layer_agg=bool(meta.get("layer_agg", True)),
                   use_covariates=bool(meta.get("covariates")),
                   covariate_readout=bool(meta.get("covariate_readout")),
                   pe_readout=bool(meta.get("pe_readout")),
-                  phys_adj=phys or None)
+                  )
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not unexpected, f"dropped trained weights: {unexpected}"
-    assert all(k.startswith(("phys_", "heads.")) for k in missing), missing
+    assert all(k.startswith("heads.") for k in missing), missing
     return model.eval().to(device)
 
 
-def score(model: Shape, target: str, device: str, batch_size: int) -> Dict:
-    ds = MultiCorpus([target], root=None).use_fold("test")
+def score(model: Shape, target: str, device: str, batch_size: int,
+          fold: str = "test") -> Dict:
+    ds = MultiCorpus([target], root=None).use_fold(fold)
     dl = DataLoader(ds, batch_sampler=BalancedBatchSampler(
         ds, {target: batch_size}, None, False, torch.Generator().manual_seed(0)),
         collate_fn=collate_pack, num_workers=2)
@@ -89,21 +85,20 @@ def score(model: Shape, target: str, device: str, batch_size: int) -> Dict:
         for b in dl:
             x = b["x"].to(device)
             pred = model(x, u=b["u"].to(device), u_mask=b["u_mask"].to(device), card=card,
+                         edge_index=b.get("edge_index"),
+                         edge_weight=b.get("edge_weight"),
                          num_nodes=b.get("num_nodes"),
                          deg=None if b["deg"] is None else b["deg"].to(device))
             preds.append(pred.float().cpu()); ys.append(b["y"])
             masks.append(None if b["mask"] is None else b["mask"])
     m = None if masks[0] is None else torch.cat(masks)
     out = metrics_for(card, torch.cat(preds), torch.cat(ys), m)
-    # Was Phi_scale actually usable here, or silently skipped?
-    active = (model.scale_proj is not None
-              and (model.scale_shared or target in model.scale_proj))
-    return out | {"scale_active": bool(active), "test_windows": len(ds)}
+    return out | {"fold": fold, "test_windows": len(ds)}
 
 
-def persistence(target: str) -> Dict:
+def persistence(target: str, fold: str = "test") -> Dict:
     """y_hat = x_t repeated over the horizon, on the same test fold."""
-    ds = MultiCorpus([target], root=None).use_fold("test")
+    ds = MultiCorpus([target], root=None).use_fold(fold)
     card = ds.sets[target].card
     preds, ys, masks = [], [], []
     for i in range(len(ds)):
@@ -125,12 +120,14 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--precision", default="bf16")
     ap.add_argument("--persistence", action="store_true")
+    ap.add_argument("--fold", default="test", choices=("val", "test"),
+                    help="which fold of the target to score")
     a = ap.parse_args()
     configure_backends(a.precision)
 
     if a.persistence:
         print(f"persistence  {a.target}  " +
-              "  ".join(f"{k} {v:.4f}" for k, v in persistence(a.target).items()), flush=True)
+              "  ".join(f"{k} {v:.4f}" for k, v in persistence(a.target, a.fold).items()), flush=True)
 
     rows: List[Dict] = []
     for f in sorted(glob.glob(os.path.join(a.runs, "*", "seed*", "train.json"))):
@@ -139,6 +136,8 @@ def main() -> None:
             print(f"skip {meta['tag']}: {a.target} is in its training set", flush=True)
             continue
         if not os.path.exists(meta.get("checkpoint") or ""):
+            print(f"skip {meta['tag']}: checkpoint missing at "
+                  f"{meta.get('checkpoint')!r}", flush=True)
             continue
         # A flat Linear(W, .) encoder *is* the training window, so it cannot be
         # run on a target of a different width; a patched one can, and that is
@@ -150,19 +149,14 @@ def main() -> None:
             print(f"skip {meta['tag']}: flat encoder trained at W={sorted(trained)}, "
                   f"target is W={tw}", flush=True)
             continue
-        if pl and tw % pl:
-            print(f"skip {meta['tag']}: target W={tw} not a multiple of patch_len={pl}",
-                  flush=True)
-            continue
-        r = score(build_model(meta, a.device), a.target, a.device, a.batch_size)
+        r = score(build_model(meta, a.device), a.target, a.device, a.batch_size, a.fold)
         r |= {"tag": meta["tag"], "seed": meta["seed"], "trained_on": meta["corpora"],
               "patch_len": pl, "train_windows": sorted(trained), "target_window": tw,
               "k": len(meta["corpora"]), "target": a.target,
-              "scale": meta.get("scale"), "scale_shared": meta.get("scale_shared"),
               "relations": meta.get("relations"), "checkpoint": meta["checkpoint"]}
         rows.append(r)
         print(f"{meta['tag']:22s} k={r['k']} seed{r['seed']}  MAE {r['MAE']:8.3f}  "
-              f"RMSE {r['RMSE']:8.3f}  scale_active={r['scale_active']}", flush=True)
+              f"RMSE {r['RMSE']:8.3f}", flush=True)
     if a.out:
         with open(a.out, "a") as fh:
             for r in rows:

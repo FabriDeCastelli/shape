@@ -1,20 +1,14 @@
-"""Phase 03: propagation over one relation, as an independently parameterised block.
+"""Propagation over one relation, as an independently parameterised block.
 
-SHAPE has always had exactly one relation -- the learned Gram graph -- and its
-message passing was written inline in ``Shape``. This module makes a relation a
-first-class object so a second one (the physical road graph) is a *sibling*
-rather than an extra term summed into the same adjacency:
+Each relation of ``eq:gsos`` is a sibling rather than an extra term summed into
+one adjacency:
 
-    z_G = B_G(h, A_gram)      z_P = B_P(h, A_phys)      z = F_rel(h, z_G, z_P)
+    Pi_gram = B_gram(H0, S_gram)   Pi_topo = B_topo(H0, S_topo)
+    Z = W_c [H0 ; Pi_gram ; Pi_topo]
 
-Independent parameters, norms, depth and dropout, which is what makes "does
-physical topology carry information the Gram graph does not?" a question about
-the relations rather than about a shared weight matrix.
-
-Phase 00 7.5 is the standing caveat: PeMS04/07/08 ship a shattered road graph
-(PeMS08: 69 components, 48 of 170 sensors isolated), so a physical block there is
-near-identity by construction of the data. Judge this on Metr-LA, PeMS-Bay and
-PeMS03, where the graph is connected.
+Independent parameters, norms, depth and dropout, which is what makes "does the
+observed topology carry information the Gram relation does not?" a question
+about the relations rather than about a shared weight matrix.
 """
 from __future__ import annotations
 
@@ -25,20 +19,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from shape.layers import Fp32LayerNorm, TemporalGlobalPoolingLayer
+from shape.layers import Fp32LayerNorm, TemporalGlobalPoolingLayer, propagate_over
 
 
 class RelationBlock(nn.Module):
-    """Residual message passing over a given ``[B,K,K]`` adjacency.
+    """eq:message and eq:relation-gate over a given ``[B,K,K]`` operator.
 
-    Identical mathematics to the loop that was inline in ``Shape.forward`` -- a
-    normalise / propagate / project / ReLU / dropout / residual stack, then the
-    depth pooling over all L+1 representations -- but owning its own parameters,
-    so two instances of it share nothing.
+    Per layer: propagate the layer-normalised state over the operator, project,
+    ReLU, dropout, admit through the gate, add the residual. The L+1
+    representations are then pooled by the layer aggregation of eq:pi.
     """
 
     def __init__(self, hidden_dim: int, num_layers: int, dropout: float = 0.1,
-                 num_heads: int = 4, gate: bool = False, inject: bool = False):
+                 num_heads: int = 4, gate: bool = True, layer_agg: bool = True):
         super().__init__()
         self.dropout = dropout
         # A per-node, per-channel gate on the aggregated message. On an unseen
@@ -46,60 +39,52 @@ class RelationBlock(nn.Module):
         # no way to decline it; the gate lets a node fall back on itself.
         self.gates = nn.ModuleList(nn.Linear(2 * hidden_dim, hidden_dim)
                                    for _ in range(num_layers)) if gate else None
-        # Re-injection of the layer-0 representation, which is f(X). Without it
-        # the source reaches layer l only through the residual chain and decays;
-        # this is the term that makes H_l = g(H_{l-1}, f(X)) literal. Initialised
-        # at zero, so an untrained model is exactly the ungated architecture.
-        self.alpha = nn.Parameter(torch.zeros(num_layers)) if inject else None
-        self.norm_in = Fp32LayerNorm(hidden_dim)
         self.convs = nn.ModuleList(nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers))
         self.norms = nn.ModuleList(Fp32LayerNorm(hidden_dim) for _ in range(num_layers))
+        # Without it the block reads H_r^(L) alone, fixing the effective
+        # propagation depth at L for every corpus. The ablation arm.
         self.depth_pool = TemporalGlobalPoolingLayer(Namespace(
             in_dim=hidden_dim, out_dim=hidden_dim, use_fc=False, attn_mask_dropout=0.0,
             mha_dropout=0.0, add_zero_attn=False, num_head=num_heads,
             alpha_type="learnable", use_layer_norm=True, skip_connection=True,
-            task="node_classification", learn_query=False))
+            task="node_classification", learn_query=False)) if layer_agg else None
 
     def forward(self, h: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
-        # h: [B, K, hidden]   a: [B, K, K]
-        h = self.norm_in(h)
-        h0, stack = h, [h]
+        # h: [B, K, hidden] = H_r^(l-1), already eq:h0-normalised   a: [B, K, K]
+        stack = [h]                                           # H_r^(0) = H^(0)
         for i, (layer, norm) in enumerate(zip(self.convs, self.norms)):
             residual = h
-            m = layer(torch.bmm(a, norm(h)))                  # [B, K, hidden]
+            m = layer(propagate_over(a, norm(h)))              # [B, K, hidden]
             m = F.dropout(F.relu(m), p=self.dropout, training=self.training)
             if self.gates is not None:
                 m = m * torch.sigmoid(self.gates[i](torch.cat([residual, m], dim=-1)))
             h = m + residual
-            if self.alpha is not None:
-                h = h + self.alpha[i] * h0
             stack.append(h)
+        if self.depth_pool is None:
+            return h                                          # H_r^(L) only
         b, k, _ = h.shape
         depth = torch.stack(stack, dim=2)                     # [B, K, L+1, hidden]
         return self.depth_pool(depth, h.new_ones((b, k), dtype=torch.bool))
 
 
 class RelationFusion(nn.Module):
-    """``z = W_c [h ; z_1 ; ... ; z_R]``, the roadmap's starting point.
+    """eq:relation-fusion: ``Z = W_c [H0 ; Pi_1 ; ... ; Pi_R]``.
 
     Concatenate-and-project rather than a sum, so the model can tell the
-    relations apart and can down-weight one to zero. ``h`` is carried through as
-    its own slot: a corpus with no usable topology must be able to fall back to
-    the un-propagated representation, and the Phase 00 7.5 graphs make that a
-    live case rather than a hypothetical.
-
-    A relation that is unavailable for this corpus contributes exact zeros
-    (``m_phys,d = 0``), which is what keeps one set of weights valid across
-    corpora that do and do not carry a physical graph.
+    relations apart and can down-weight one to zero. ``H0`` is carried through as
+    its own slot, so a corpus with no usable topology can fall back on the
+    un-propagated representation. A relation unavailable for this corpus
+    contributes exact zeros, which keeps one set of weights valid across corpora
+    that do and do not carry a graph.
     """
 
     def __init__(self, hidden_dim: int, num_relations: int):
         super().__init__()
         self.num_relations = num_relations
         self.proj = nn.Linear(hidden_dim * (num_relations + 1), hidden_dim)
-        # Zero-init so the block starts as a pure pass-through of h: at step 0
-        # the model is exactly the pre-Phase-03 one plus an identity, which keeps
-        # a regression against it meaningful.
+        # W_c = [I, 0, ..., 0]: the block starts as an identity on H0, so the
+        # temporal representation is not perturbed by untrained relational
+        # pathways.
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
         with torch.no_grad():
@@ -123,31 +108,6 @@ def gaussian_kernel(dist: torch.Tensor) -> torch.Tensor:
     return torch.exp(-((dist / sigma) ** 2))
 
 
-def physical_adjacency(edge_index: Optional[torch.Tensor],
-                       edge_weight: Optional[torch.Tensor], num_nodes: int,
-                       weighting: str = "binary") -> Optional[torch.Tensor]:
-    """Dense symmetric-normalised ``[N,N]`` for the corpus's own topology.
-
-    ``None`` when the corpus ships no usable graph, which is the ``m_phys,d = 0``
-    case. Normalisation matches the Gram graph's (``D^-1/2 A D^-1/2`` with
-    degrees from ``|A|``) so the two relations differ in *what* they connect, not
-    in how the operator is scaled.
-    """
-    if edge_index is None or edge_index.numel() == 0:
-        return None
-    src, dst = edge_index[0].long(), edge_index[1].long()
-    if weighting == "gaussian" and edge_weight is not None:
-        w = gaussian_kernel(edge_weight.reshape(-1).float())
-    else:
-        w = torch.ones(src.numel())
-    a = torch.zeros(num_nodes, num_nodes)
-    a[src, dst] = w
-    a = torch.maximum(a, a.t())                       # the road graph is undirected
-    a.fill_diagonal_(1.0)                             # self-loop, as in the Gram graph
-    deg = a.abs().sum(-1).clamp(min=1e-6).pow(-0.5)   # [N]
-    return deg.unsqueeze(1) * a * deg.unsqueeze(0)
-
-
 def _self_check() -> None:
     torch.manual_seed(0)
     b, k, hid = 2, 12, 16
@@ -168,17 +128,23 @@ def _self_check() -> None:
         z = fus(h, [torch.randn_like(h), None])
     assert torch.allclose(z, h, atol=1e-6), (z - h).abs().max()
 
-    ei = torch.tensor([[0, 1, 2], [1, 2, 0]])
-    ew = torch.tensor([10.0, 20.0, 30.0])
-    for mode in ("binary", "gaussian"):
-        adj = physical_adjacency(ei, ew, 4, mode)
-        assert adj.shape == (4, 4)
-        assert torch.allclose(adj, adj.t(), atol=1e-6), "adjacency must be symmetric"
-        assert torch.isfinite(adj).all()
-    # An isolated node keeps its self-loop and does not divide by zero -- 28% of
-    # PeMS08's sensors are in exactly this position (phase_00 7.5).
-    assert abs(float(physical_adjacency(ei, ew, 4, "binary")[3, 3]) - 1.0) < 1e-6
-    assert physical_adjacency(None, None, 4) is None
+    # The gate is on by default and must be able to shut a relation off: with a
+    # saturated-negative gate the block reduces to its input.
+    blk = RelationBlock(hid, num_layers=2).eval()
+    assert blk.gates is not None, "gate must default on: it is eq:relation-gate"
+    with torch.no_grad():
+        for g in blk.gates:
+            g.bias.fill_(-30.0); g.weight.zero_()
+        # No message is admitted, so the output cannot depend on the operator.
+        other = torch.rand(b, k, k)
+        assert torch.allclose(blk(h, a), blk(h, other), atol=1e-5)
+
+    # Without layer aggregation the block returns H_r^(L) and owns no pool.
+    plain = RelationBlock(hid, num_layers=2, layer_agg=False).eval()
+    assert plain.depth_pool is None
+    with torch.no_grad():
+        assert plain(h, a).shape == (b, k, hid)
+
     print("relations self-check ok")
 
 

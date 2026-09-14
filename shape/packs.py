@@ -111,6 +111,25 @@ class HomogeneousBatchSampler(torch.utils.data.Sampler):
         return len(self._batches())
 
 
+
+def _remap_edges(items: List[Dict], union: torch.Tensor, num_nodes: int):
+    """Edge lists reindexed into the batch union, dropping edges that leave it."""
+    if items[0].get("edge_index") is None:
+        return None, None
+    pos = torch.full((num_nodes,), -1, dtype=torch.long)
+    pos[union] = torch.arange(union.numel())
+    eis, ews, have_w = [], [], items[0].get("edge_weight") is not None
+    for it in items:
+        ei = it.get("edge_index")
+        if ei is None or ei.numel() == 0:
+            eis.append(None); ews.append(None); continue
+        src, dst = pos[ei[0].long()], pos[ei[1].long()]
+        keep = (src >= 0) & (dst >= 0)
+        eis.append(torch.stack([src[keep], dst[keep]]))
+        ews.append(it["edge_weight"].reshape(-1)[keep] if have_w else None)
+    return eis, (ews if have_w else None)
+
+
 def collate_pack(items: List[Dict]) -> Dict:
     """A homogeneous batch, tagged with its network.
 
@@ -133,10 +152,19 @@ def collate_pack(items: List[Dict]) -> Dict:
     compact = densify_union(items)
     if compact is not None:
         out["x"], out["node_ids"], out["num_nodes"], out["pe"] = compact   # [B, K, W, C]
+        # Edges must follow the same remapping as x. densify_union reindexes the
+        # nodes into the batch union, so a raw edge list would address the wrong
+        # pairs -- silently, since the shapes still line up.
+        out["edge_index"], out["edge_weight"] = _remap_edges(
+            items, out["node_ids"], int(items[0]["num_nodes"]))
     else:
         out["x"] = torch.stack([it["x"] for it in items])      # [B, N, W, C]
         if items[0].get("pe") is not None:
             out["pe"] = torch.stack([it["pe"] for it in items])  # [B, N, 16]
+        out["edge_index"] = (None if items[0].get("edge_index") is None
+                             else [it["edge_index"] for it in items])
+        out["edge_weight"] = (None if items[0].get("edge_weight") is None
+                              else [it["edge_weight"] for it in items])
     if items[0]["mask"] is not None:
         out["mask"] = torch.stack([it["mask"] for it in items])
     return out

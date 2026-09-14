@@ -18,7 +18,7 @@ outputs/
 *.log
 
 # paper sources are kept on Overleaf
-report/
+paper_iclr/
 
 # latex build artifacts
 *.aux
@@ -28,4 +28,6 @@ report/
 *.synctex.gz
 *.bbl
 *.blg
-/.jobs.lock
+data
+/wandb/
+/results/

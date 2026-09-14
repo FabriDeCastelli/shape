@@ -47,18 +47,11 @@ def load_checkpoint(path: str, hidden: int, layers: int, device: str) -> Shape:
     state = {k[len("model."):]: v for k, v in
              torch.load(path, map_location="cpu", weights_only=False)["state_dict"].items()
              if k.startswith("model.")}
-    # A gram+phys checkpoint carries one normalised adjacency buffer per traffic
-    # corpus. They are rebuilt from the checkpoint itself rather than re-derived,
-    # so the load can stay strict: a silently dropped weight here would be
-    # reported as a zero-shot score.
-    phys = {k[len("phys_"):]: v for k, v in state.items() if k.startswith("phys_")}
     model = Shape(cards, hidden_dim=hidden, num_layers=layers,
                   # train_pack records the readout; pretrain does not and takes
                   # Shape's own default, so the fallback differs by run kind.
                   readout=meta.get("readout", "informed" if "networks" in meta else "linear"),
-                  relations=meta.get("relations", "legacy"),
-                  use_scale=meta.get("scale", False),
-                  scale_shared=meta.get("scale_shared", False),
+                  relations=meta["relations"],
                   patch_len=meta.get("patch_len", 0) or 0,
                   use_covariates=meta.get("covariates", False),
                   # Every optional component has to be rebuilt from the recorded
@@ -66,12 +59,10 @@ def load_checkpoint(path: str, hidden: int, layers: int, device: str) -> Shape:
                   # under a non-strict load it would silently drop trained weights
                   # and be reported as a zero-shot score.
                   rel_gate=meta.get("rel_gate", False),
-                  rel_inject=meta.get("rel_inject", False),
-                  soft_topk=meta.get("soft_topk", False),
                   attn_depth=meta.get("attn_depth", 0) or 0,
                   covariate_readout=meta.get("covariate_readout", False),
                   pe_readout=meta.get("pe_readout", False),
-                  phys_adj=phys or None)
+                  )
     model.load_state_dict(state)
     return model.to(device).eval(), meta
 
@@ -90,6 +81,8 @@ def score_network(model: Shape, network: str, device: str, batch_size: int,
         with autocast:
             pred = model(batch["x"].to(device), u=batch["u"].to(device),
                          u_mask=batch["u_mask"].to(device), card=card,
+                         edge_index=batch.get("edge_index"),
+                         edge_weight=batch.get("edge_weight"),
                          num_nodes=batch.get("num_nodes"),
                          deg=None if batch.get("deg") is None else batch["deg"].to(device))
         preds.append(pred.float().reshape(-1).cpu())
@@ -139,9 +132,8 @@ def main() -> None:
                 r |= {"pack": meta.get("pack", meta.get("tag")), "seed": meta["seed"],
                       "checkpoint": ckpt,
                       "val_auc": meta.get("val_auc", meta.get("val_macro")),
-                      "ablate": meta.get("ablate", "none"),
                       "readout": meta.get("readout", "informed"),
-                      "relations": meta.get("relations", "legacy")}
+                      "relations": meta["relations"]}
                 rows.append(r)
                 fh.write(json.dumps(r) + "\n")
                 fh.flush()

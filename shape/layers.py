@@ -5,7 +5,7 @@ trunk invariant to any affine transform of its input -- what reaches the graph i
 shape, never amplitude. ``TemporalGlobalPoolingLayer`` pools the GNN depth axis.
 """
 from argparse import Namespace
-from typing import Optional
+from typing import Optional, Tuple
 
 import math
 
@@ -177,19 +177,10 @@ class PatchTemporalEncoder(nn.Module):
 
     def forward(self, x):
         # x: [..., window]
-        w = x.shape[-1]
-        if w % self.patch_len:
-            raise ValueError(f"window {w} is not a multiple of patch_len {self.patch_len}")
-        p = w // self.patch_len
-        # Instance-normalise over the whole window, exactly as the flat encoder
-        # does, so the two differ only in how the window is projected.
-        with no_autocast(x):
-            x = x.float()
-            x = (x - x.mean(dim=-1, keepdim=True)) / x.std(dim=-1, keepdim=True).clamp(min=1e-5)
-        patches = x.reshape(*x.shape[:-1], p, self.patch_len)      # [..., P, patch_len]
+        patches, p = patchify(x, self.patch_len)                   # [..., P, patch_len]
         value, gate = self.proj(patches).chunk(2, dim=-1)          # each [..., P, hidden]
         h = value * F.silu(gate) + sinusoidal_distance(p, self.hidden_dim,
-                                                       x.device, value.dtype)
+                                                       patches.device, value.dtype)
         with no_autocast(h):
             h = self.norm(h.float())
         if self.score is not None:
@@ -202,6 +193,28 @@ class PatchTemporalEncoder(nn.Module):
 
 # torch's efficient attention refuses a batch above 65535; stay clear of it.
 ATTN_CHUNK = 8192
+
+
+def patchify(x: torch.Tensor, patch_len: int) -> Tuple[torch.Tensor, int]:
+    """Instance-normalised window -> ``[..., P, patch_len]`` with ``P = ceil(w/q)``.
+
+    A window that is not a multiple of the patch length is padded at its *oldest*
+    end, the convention TimesFM and Chronos use, so every patch keeps its
+    distance from the present and the most recent patch is always complete.
+    Padding follows the normalisation, so a padded entry is exactly the window
+    mean. A ceiling can only ever leave the oldest patch partially filled and
+    that patch still carries real observations, so there is nothing for a
+    key-padding mask to suppress.
+    """
+    w = x.shape[-1]
+    p = math.ceil(w / patch_len)
+    with no_autocast(x):
+        x = x.float()
+        x = (x - x.mean(dim=-1, keepdim=True)) / x.std(dim=-1, keepdim=True).clamp(min=1e-5)
+    pad = p * patch_len - w
+    if pad:
+        x = F.pad(x, (pad, 0))
+    return x.reshape(*x.shape[:-1], p, patch_len), p
 
 
 def sinusoidal_distance(p: int, d: int, device, dtype) -> torch.Tensor:
@@ -257,18 +270,12 @@ class CausalPatchEncoder(nn.Module):
 
     def forward(self, x):
         # x: [..., window]
-        w = x.shape[-1]
-        if w % self.patch_len:
-            raise ValueError(f"window {w} is not a multiple of patch_len {self.patch_len}")
-        p = w // self.patch_len
-        with no_autocast(x):
-            x = x.float()
-            x = (x - x.mean(dim=-1, keepdim=True)) / x.std(dim=-1, keepdim=True).clamp(min=1e-5)
         lead = x.shape[:-1]                                        # [B, N]
-        patches = x.reshape(-1, p, self.patch_len)                 # [M, P, patch_len]
+        patches, p = patchify(x, self.patch_len)                   # [..., P, patch_len]
+        patches = patches.reshape(-1, p, self.patch_len)           # [M, P, patch_len]
         value, gate = self.proj(patches).chunk(2, dim=-1)          # each [M, P, hidden]
         h = value * F.silu(gate) + sinusoidal_distance(p, self.hidden_dim,
-                                                       x.device, value.dtype)  # [M,P,hidden]
+                                                       patches.device, value.dtype)  # [M,P,hidden]
         with no_autocast(h):
             h = self.norm(h.float()).to(value.dtype)               # [M, P, hidden]
         # A single patch has nothing to attend to, and a causal mask over one
@@ -341,6 +348,65 @@ def dense_adj(edge_index, edge_weight, num_nodes: int, device, dtype) -> torch.T
     return symmetric_normalize_dense(a).to(dtype)                      # [B, N, N]
 
 
+# A dense [B,N,N] is the fast path and is what the spatiotemporal graphs use
+# (PeMS07, the largest, is 883 nodes = 100 MB at batch 32). A MiNT batch union
+# reaches ~30k nodes, where the same tensor is 116 GB, so above this many entries
+# the identical operator is built sparse instead. 64M entries is 256 MB in fp32.
+DENSE_ADJ_MAX = 64_000_000
+
+
+def sparse_adj(edge_index, edge_weight, num_nodes: int, device, dtype) -> torch.Tensor:
+    """The operator of ``dense_adj``, stored as one block-diagonal sparse matrix.
+
+    Sample ``i``'s nodes occupy rows ``i*N ... (i+1)*N``, so a single
+    ``torch.sparse.mm`` propagates the whole batch and no pair from different
+    samples can interact. Costs O(m) rather than O(B N^2), which is the
+    complexity the paper states for the topology relation.
+    """
+    b = len(edge_index)
+    rows, cols, vals = [], [], []
+    for i, ei in enumerate(edge_index):
+        if ei is None or ei.numel() == 0:
+            continue
+        off = i * num_nodes
+        src = ei[0].long().to(device) + off
+        dst = ei[1].long().to(device) + off
+        w = (torch.ones(src.numel(), device=device, dtype=torch.float32)
+             if edge_weight is None
+             else edge_weight[i].reshape(-1).float().to(device))          # [E]
+        # Undirected, matching dense_adj's ``a + a.T``: a self-loop is doubled
+        # there too, so the two paths agree entry for entry.
+        rows.append(torch.cat([src, dst])); cols.append(torch.cat([dst, src]))
+        vals.append(torch.cat([w, w]))
+    n = b * num_nodes
+    if not rows:
+        return torch.sparse_coo_tensor(torch.empty(2, 0, dtype=torch.long, device=device),
+                                       torch.empty(0, device=device, dtype=dtype),
+                                       (n, n)).coalesce()
+    idx = torch.stack([torch.cat(rows), torch.cat(cols)])                  # [2, 2E]
+    a = torch.sparse_coo_tensor(idx, torch.cat(vals), (n, n)).coalesce()
+    i, v = a.indices(), a.values()
+    # D^-1/2 A D^-1/2 with degrees from |A|, exactly as symmetric_normalize_dense.
+    deg = torch.zeros(n, device=device, dtype=torch.float32).index_add_(0, i[0], v.abs())
+    inv = deg.clamp_min(1e-6).rsqrt()                                      # [B*N]
+    return torch.sparse_coo_tensor(i, (v * inv[i[0]] * inv[i[1]]).to(dtype),
+                                   (n, n)).coalesce()
+
+
+def propagate_over(a: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    """``S H`` for a dense ``[B,K,K]`` or a block-diagonal sparse ``[B*K, B*K]``."""
+    if not a.is_sparse:
+        return torch.bmm(a, h)
+    b, k, d = h.shape
+    # torch.sparse.mm has no bf16 kernel ("addmm_sparse_cuda not implemented for
+    # BFloat16"), and calling .float() is not enough on its own: under autocast
+    # the op is intercepted and its inputs cast straight back to bf16. Autocast
+    # has to be disabled for the region, not just the operands.
+    with no_autocast(h):
+        out = torch.sparse.mm(a.float(), h.reshape(b * k, d).float())
+    return out.reshape(b, k, d).to(h.dtype)
+
+
 def symmetric_normalize_dense(a: torch.Tensor) -> torch.Tensor:
     """``D^-1/2 A D^-1/2`` with degrees from ``|A|``.
 
@@ -364,36 +430,6 @@ def top_k_sparsify(logits: torch.Tensor, k: int) -> torch.Tensor:
         return logits
     threshold = logits.abs().topk(k, dim=-1).values[..., -1:]   # [B, N, 1]
     return logits * (logits.abs() >= threshold)
-
-
-class SoftSparsify(nn.Module):
-    """Learned magnitude threshold instead of a fixed ``k``.
-
-    ``top_k_sparsify`` keeps a fixed number of edges per row whatever the graph
-    looks like. That is a constant across corpora whose similarity distributions
-    are not: PeMS rows are dense and highly correlated, MiNT rows are sparse, and
-    one ``k`` cannot be right for both. It is also non-differentiable, so the
-    trunk gets no gradient telling it how selective to be.
-
-    Here each edge is kept in proportion to a smooth gate on its magnitude,
-
-        a_ij = s_ij * sigmoid( (|s_ij| - tau) / temp )
-
-    with ``tau`` and ``temp`` learned. Every edge survives with some weight, so
-    no node can be isolated by the sparsifier, and the threshold adapts to the
-    corpus rather than to a hyperparameter. ``tau`` starts at 0 and ``temp``
-    small, which is close to a pass-through of the signed similarity.
-    """
-
-    def __init__(self, tau_init: float = 0.0, temp_init: float = 0.1):
-        super().__init__()
-        self.tau = nn.Parameter(torch.tensor(float(tau_init)))
-        self.log_temp = nn.Parameter(torch.tensor(float(temp_init)).log())
-
-    def forward(self, logits: torch.Tensor) -> torch.Tensor:
-        # logits: [B, K, K]
-        temp = self.log_temp.exp().clamp(min=1e-3)
-        return logits * torch.sigmoid((logits.abs() - self.tau) / temp)
 
 
 class TemporalGlobalPoolingLayer(nn.Module):

@@ -1,14 +1,12 @@
 """SHAPE: one shared backbone over every dataset in the corpus.
 
-    x -> temporal encoder -> Z -> cosine Gram graph -> GNN -> task head
+    x -> patched temporal encoder -> H0 -> {gram, topo} propagation -> fusion -> head
 
+The two relations of ``eq:gsos`` are independently parameterised blocks whose
+outputs are concatenated with ``H0`` and projected (``eq:relation-fusion``).
 Adapters are looked up by key, never branched on: a static projection per
 embedding width, a node-classification head per class count. Forecasting and
 graph-classification heads are shared across every dataset of that task.
-
-The physical graph is deliberately unused -- ``edge_index``/``edge_weight`` are
-accepted so the interface stays stable, but message passing runs on the learned
-Gram graph. Phi_f and Phi_p are unread.
 """
 from __future__ import annotations
 
@@ -18,11 +16,13 @@ from typing import Dict, List, Optional, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from shape.data import H_MAX, DatasetCard
 from shape.layers import TemporalGlobalPoolingLayer
-from shape.layers import (CausalPatchEncoder, PatchTemporalEncoder, Fp32LayerNorm, dense_adj,
-                          FiLMReadout, SoftSparsify,
+from shape.layers import (CausalPatchEncoder, PatchTemporalEncoder, Fp32LayerNorm,
+                          DENSE_ADJ_MAX, dense_adj, sparse_adj,
+                          FiLMReadout,
                           SourceFusion, TemporalGraphEncoder,
                           no_autocast, symmetric_normalize_dense, top_k_sparsify)
 from shape.relations import RelationBlock, RelationFusion
@@ -38,6 +38,20 @@ TEMPORAL_GROUPS = ("real", "probe")
 # will OOM on the largest corpora.
 NODE_BUDGET = 4096
 
+# Rows per encoder pass. The probe puts every channel of every node on the batch
+# axis, so a MiNT batch reaches ~10^6 rows and it is the encoder's retained
+# activations, not the model, that fill the card (38 GiB at batch 32). Above this
+# many rows the encoder is recomputed chunk by chunk in the backward pass, which
+# makes the peak a function of the chunk instead of of the batch's node union,
+# for roughly one extra forward. The maths is unchanged.
+# 32768 is chosen so every flow and transport corpus stays on the direct path
+# (PeMS07, the largest, is 32*1*883 = 28,256 rows) and only the transaction and
+# social corpora, which reach ~3*10^5 rows, are chunked. Dropout is drawn per
+# chunk, so a chunked run is statistically but not bitwise identical to a direct
+# one; keeping the spatiotemporal corpora below the threshold keeps them exactly
+# reproducible against the runs already in results/final/.
+ENCODE_CHUNK = 32_768
+
 
 def temporal_channels(card: DatasetCard) -> List[int]:
     """Indices of the channels that carry an actual time signal."""
@@ -52,11 +66,17 @@ def temporal_channels(card: DatasetCard) -> List[int]:
 def head_key(card: DatasetCard) -> str:
     """Which head a dataset uses.
 
-    Forecasting and graph classification share one head per task -- every
-    forecast dataset emits H_MAX horizons and every MiNT network emits one
-    logit. Node classification cannot share: ArXiv has 40 classes, DBLP10 has 10.
+    Graph classification shares one head across corpora, since every MiNT
+    network emits one logit. Forecasting shares a head only across corpora with
+    the *same* horizon: a 12-step traffic head and a 168-step mobility head have
+    different output widths and cannot be the same matrix. Node classification
+    cannot share at all: ArXiv has 40 classes, DBLP10 has 10.
     """
-    return card.name if card.task == "node-classify" else card.task
+    if card.task == "node-classify":
+        return card.name
+    if card.task == "forecast":
+        return f"forecast-{card.H}"
+    return card.task
 
 
 class InformedGraphHead(nn.Module):
@@ -102,7 +122,7 @@ class InformedGraphHead(nn.Module):
 
 def make_head(card: DatasetCard, hidden_dim: int, readout: str = "linear") -> nn.Module:
     if card.task == "forecast":
-        return nn.Linear(hidden_dim, H_MAX)      # sliced to card.H at the output
+        return nn.Linear(hidden_dim, card.H)     # one head per distinct horizon
     if card.task == "node-classify":
         return nn.Linear(hidden_dim, card.num_classes)
     if card.task == "graph-classify":
@@ -120,13 +140,10 @@ class Shape(nn.Module):
                  eval_chunk: int = 0,
                  revin: bool = True, use_covariates: bool = False,
                  sparse_encode_below: float = 0.5, graph_pool: str = "mean_all",
-                 ablate: str = "none", readout: str = "linear", fuse: str = "mean",
-                 relations: str = "legacy",
-                 phys_adj: Optional[Dict[str, torch.Tensor]] = None,
-                 use_scale: bool = False, scale_shared: bool = False,
-                 patch_len: int = 0, patch_pool: str = "mean",
-                 attn_depth: int = 0, rel_gate: bool = False,
-                 rel_inject: bool = False, soft_topk: bool = False,
+                 readout: str = "linear", fuse: str = "mean",
+                 relations: str = "gram+topo",
+                 patch_len: int = 12, patch_pool: str = "mean",
+                 attn_depth: int = 2, rel_gate: bool = True, layer_agg: bool = True,
                  covariate_readout: bool = False, pe_readout: bool = False,
                  pe_dim: int = 16):
         super().__init__()
@@ -137,10 +154,6 @@ class Shape(nn.Module):
         if len(windows) != 1 and not patch_len:
             raise ValueError(f"the contract fixes one W for the corpus; got {sorted(windows)}; "
                              "pass patch_len to mix windows")
-        for c in cards:
-            if patch_len and c.W % patch_len:
-                raise ValueError(f"{c.name}: W={c.W} is not a multiple of patch_len={patch_len}")
-
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.top_k = top_k
@@ -161,13 +174,6 @@ class Shape(nn.Module):
         # or a frozen-model embedding distinguishable from the raw window.
         self.fuse = fuse
         self.source_fusion = SourceFusion(hidden_dim) if fuse == "attn" else None
-        # Controls for "what is the pattern extractor worth?":
-        #   degrees_only -> readout sees the degree features alone (embedding zeroed)
-        #   no_graph     -> node embeddings skip message passing entirely
-        # Both keep every other part of the pipeline identical.
-        if ablate not in ("none", "degrees_only", "no_graph"):
-            raise ValueError(f"unknown ablation {ablate!r}")
-        self.ablate = ablate
         self.cards: Dict[str, DatasetCard] = {c.name: c for c in cards}
         self._temporal_idx = {c.name: torch.tensor(temporal_channels(c)) for c in cards}
 
@@ -184,17 +190,9 @@ class Shape(nn.Module):
                         PatchTemporalEncoder(patch_len, hidden_dim, pool=patch_pool)
                         if patch_len else
                         TemporalGraphEncoder(window=w, hidden_dim=hidden_dim))
-        # A learned threshold in place of the fixed k. See SoftSparsify.
-        self.soft_sparsify = SoftSparsify() if soft_topk else None
+        # eq:h0's outer LayerNorm. The relation blocks consume H0 directly, so
+        # this is the only normalisation between the encoder and eq:gram.
         self.pre_mp_norm = Fp32LayerNorm(hidden_dim)
-        self.convs = nn.ModuleList(nn.Linear(hidden_dim, hidden_dim) for _ in range(num_layers))
-        self.norms = nn.ModuleList(Fp32LayerNorm(hidden_dim) for _ in range(num_layers))
-        self.depth_pool = TemporalGlobalPoolingLayer(Namespace(
-            in_dim=hidden_dim, out_dim=hidden_dim, use_fc=False, attn_mask_dropout=0.0,
-            mha_dropout=0.0, add_zero_attn=False, num_head=4, alpha_type="learnable",
-            use_layer_norm=True, skip_connection=True, task="node_classification",
-            learn_query=False,
-        ))
 
         # --- adapters, looked up not branched on ---
         self.static_proj = nn.ModuleDict({
@@ -232,55 +230,18 @@ class Shape(nn.Module):
         if self.pe_proj is not None:
             nn.init.zeros_(self.pe_proj[-1].weight); nn.init.zeros_(self.pe_proj[-1].bias)
 
-        # --- relations ---
-        # "legacy" is the pre-Phase-03 inline Gram loop and stays the default, so
-        # every measured result and every checkpoint keeps its meaning. Anything
-        # else routes through independently parameterised RelationBlocks joined by
-        # a concat-project fusion, which is what makes "is the physical graph
-        # complementary to the Gram graph?" a question about the relations rather
-        # than about a shared weight matrix.
+        # --- relations (eq:gsos) ---
+        # "none" is the no-propagation ablation: zero relations, so the fusion is
+        # an identity-initialised linear on H0 alone.
         self.relations = relations
-        # "none" keeps the new path but with zero relations, so the fusion is an
-        # identity-initialised linear on h alone -- the raw-h control the roadmap
-        # asks for, differing from the relation arms in nothing but the relations.
-        self.rel_names: List[str] = ([] if relations in ("legacy", "none")
-                                     else relations.split("+"))
+        self.rel_names: List[str] = [] if relations == "none" else relations.split("+")
         for r in self.rel_names:
-            if r not in ("gram", "phys", "ident", "dyn"):
+            if r not in ("gram", "gramx", "topo"):
                 raise ValueError(f"unknown relation {r!r}")
-        self.rel_blocks = None if relations == "legacy" else nn.ModuleDict(
-            {r: RelationBlock(hidden_dim, num_layers, dropout,
-                              gate=rel_gate, inject=rel_inject) for r in self.rel_names})
-        self.rel_fusion = None if relations == "legacy" else \
-            RelationFusion(hidden_dim, len(self.rel_names))
-        # Traffic topology is static over time, so the normalised adjacency is a
-        # constant of the corpus and rides with the model rather than the batch.
-        # A corpus with none is the m_phys,d = 0 case and contributes zeros.
-        self._phys = set()
-        for name, adj in (phys_adj or {}).items():
-            self.register_buffer(f"phys_{name}", adj)
-            self._phys.add(name)
-
-        # Phi_scale: the per-node, per-window [mean, std] the instance norm throws
-        # away. RevIN puts the level back at the *output*; nothing puts it back at
-        # the input, so the trunk cannot condition on amplitude -- it cannot know a
-        # sensor is at 20 vehicles/5min rather than 400. Two numbers per node,
-        # derived from x, so unlike Phi_f this source costs no storage at all.
-        # Per-corpus by default, which is what Phase 05 measured. A shared
-        # projection is the only variant that survives transfer: an unseen corpus
-        # has no entry of its own, so the per-corpus form silently drops the
-        # source exactly when it is being asked to generalise. mu and sigma are
-        # taken from the globally z-scored signal, so they are already a
-        # corpus-relative regime code and one map is well posed across corpora.
-        self.scale_shared = scale_shared
-        if not use_scale:
-            self.scale_proj = None
-        elif scale_shared:
-            self.scale_proj = nn.Linear(2, hidden_dim)
-        else:
-            self.scale_proj = nn.ModuleDict({
-                c.name: nn.Linear(2, hidden_dim) for c in cards
-                if c.channel_groups.get("real")})
+        self.rel_blocks = nn.ModuleDict(
+            {r: RelationBlock(hidden_dim, num_layers, dropout, gate=rel_gate,
+                              layer_agg=layer_agg) for r in self.rel_names})
+        self.rel_fusion = RelationFusion(hidden_dim, len(self.rel_names))
 
         self.heads = nn.ModuleDict()
         for c in cards:
@@ -336,7 +297,7 @@ class Shape(nn.Module):
             const = self.encoder(rows.new_zeros(1, w))       # [1, hidden]
             acc = const.expand(b * n, self.hidden_dim) * float(c)   # every channel inactive
             if sel.numel():
-                z_sel = self.encoder(rows.index_select(0, sel))     # [nnz, hidden]
+                z_sel = self._encode_rows(rows.index_select(0, sel))  # [nnz, hidden]
                 # row r <-> (batch b_i, channel c_i, node) with r = (b_i*c + c_i)*n + node
                 tgt = (sel // (c * n)) * n + (sel % n)              # [nnz] into [B*N]
                 acc = acc.index_add(0, tgt, z_sel - const)
@@ -353,7 +314,10 @@ class Shape(nn.Module):
                 return self.source_fusion(tok, ids)
             return pooled
 
-        z = self.encoder(flat)                               # [B*Ct, N, hidden]
+        # Chunked for the same reason the sparse path is: a MiNT batch puts
+        # B*Ct*N ~ 3*10^5 rows through the encoder at once, and it is the
+        # retained activations rather than the model that fill the card.
+        z = self._encode_rows(flat.reshape(-1, w)).view(b * c, n, self.hidden_dim)
         zc = z.view(b, c, n, self.hidden_dim)                # [B, Ct, N, hidden]
         if self.source_fusion is not None:
             tok = zc if not extra else torch.cat([zc, torch.stack(extra, dim=1)], dim=1)
@@ -365,6 +329,24 @@ class Shape(nn.Module):
         return zc.mean(dim=1)                                # [B, N, hidden]
 
     # ------------------------------------------------------------------- graph
+
+    def _encode_rows(self, r: torch.Tensor) -> torch.Tensor:
+        """``[M, W] -> [M, hidden]``, recomputing activations when M is large.
+
+        Identical output to ``self.encoder(r)``. Only the memory profile differs:
+        a checkpointed chunk keeps its inputs rather than its intermediates and
+        recomputes them in the backward pass.
+        """
+        if r.shape[0] <= ENCODE_CHUNK:
+            return self.encoder(r)
+        if not torch.is_grad_enabled():
+            # No autograd graph to bound here, but a single forward over ~10^6
+            # rows still materialises its own intermediates all at once (8.4 GiB
+            # inside one rms_norm, which is how validation OOMed). Chunk anyway;
+            # there is simply nothing to recompute, so no checkpoint is needed.
+            return torch.cat([self.encoder(c) for c in r.split(ENCODE_CHUNK)], dim=0)
+        return torch.cat([checkpoint(self.encoder, c, use_reentrant=False)
+                          for c in r.split(ENCODE_CHUNK)], dim=0)
 
     def gram_chunks(self, x: torch.Tensor, card: DatasetCard) -> List[torch.Tensor]:
         """Node blocks the Gram graph is built over this step.
@@ -394,20 +376,23 @@ class Shape(nn.Module):
             return list(eligible.split(self.eval_chunk))
         return [eligible]
 
-    def _message_pass(self, sub: torch.Tensor) -> torch.Tensor:
-        """One Gram block: build the graph, propagate over it, pool the depth axis."""
-        # sub: [B, K, hidden]
-        a = self.gram_graph(sub)                              # [B, K, K]
-        stack = [sub]
-        for layer, norm in zip(self.convs, self.norms):
-            residual = sub
-            sub = layer(torch.bmm(a, norm(sub)))              # [B, K, hidden]
-            sub = F.dropout(F.relu(sub), p=self.dropout, training=self.training)
-            sub = sub + residual
-            stack.append(sub)
-        b, k, _ = sub.shape
-        depth = torch.stack(stack, dim=2)                     # [B, K, L+1, hidden]
-        return self.depth_pool(depth, sub.new_ones((b, k), dtype=torch.bool))   # [B, K, hidden]
+    def input_graph(self, x: torch.Tensor, nodes: torch.Tensor) -> torch.Tensor:
+        """All-In's K^(0): node covariance of the centred *input* features.
+
+        ``gram_graph`` builds its operator from the hidden state it then averages,
+        so each node's neighbours are by construction the nodes most parallel to
+        it. For a convex combination over that set, cos(h_i, (Ah)_i) >= tau_i with
+        tau_i the k-th largest cosine, which pins propagation near the identity
+        however dense the operator looks. Building the operator from the input
+        instead breaks that self-reference: the operator is a fixed property of
+        the corpus, not a function of the representation it acts on.
+        """
+        f = x.index_select(1, nodes).flatten(2).float()        # [B, K, W*C]
+        f = f - f.mean(dim=1, keepdim=True)                    # centre across nodes
+        with no_autocast(f):
+            zn = F.normalize(f.float(), p=2, dim=-1)           # [B, K, W*C] fp32
+        logits = torch.bmm(zn, zn.transpose(1, 2))             # [B, K, K]
+        return symmetric_normalize_dense(top_k_sparsify(logits, self.top_k))
 
     def gram_graph(self, z: torch.Tensor) -> torch.Tensor:
         """Cosine similarity between node representations, sparsified and normalised.
@@ -423,8 +408,7 @@ class Shape(nn.Module):
         with no_autocast(z):
             zn = F.normalize(z.float(), p=2, dim=-1)         # [B, K, hidden] fp32
         logits = torch.bmm(zn, zn.transpose(1, 2))           # [B, K, K], bf16 under autocast
-        sparse = (self.soft_sparsify(logits) if self.soft_sparsify is not None
-                  else top_k_sparsify(logits, self.top_k))
+        sparse = top_k_sparsify(logits, self.top_k)
         return symmetric_normalize_dense(sparse)
 
     def _inactive_h(self, x: torch.Tensor) -> torch.Tensor:
@@ -456,56 +440,30 @@ class Shape(nn.Module):
         h_tsfm = (self.tsfm_proj[card.name](x[:, :, -1, tsfm[0]:tsfm[1]])
                   if tsfm else None)                          # [B, N, hidden]
 
-        h_scale = None
-        proj = None
-        if self.scale_proj is not None and card.channel_groups.get("real"):
-            # ModuleDict has no .get; an unseen corpus must resolve to None, which
-            # is the whole point of the shared variant.
-            proj = (self.scale_proj if self.scale_shared
-                    else (self.scale_proj[card.name]
-                          if card.name in self.scale_proj else None))
-        if proj is not None:
-            real = card.channel_groups["real"]
-            with no_autocast(x):
-                series = x[..., real[0]].float()              # [B, N, W]
-                stats = torch.stack([series.mean(-1),
-                                     series.std(-1).clamp(min=1e-5)], dim=-1)   # [B, N, 2]
-            h_scale = proj(stats.to(x.dtype))                # [B, N, hidden]
-
         if self.source_fusion is not None:
             # A source is a token, so static competes with the channels for the
             # query's attention instead of being added on top of them.
-            extra = [t for t in (h_static, h_tsfm, h_scale) if t is not None]
+            extra = [t for t in (h_static, h_tsfm) if t is not None]
             return self.encode_temporal(x, card, extra=extra or None)
         h = self.encode_temporal(x, card)                     # [B, N, hidden]
         if static:
             h = h + h_static
         if h_tsfm is not None:
             h = h + h_tsfm
-        if h_scale is not None:
-            h = h + h_scale
         return h
 
     # -------------------------------------------------------------- relations
 
     def relate(self, h: torch.Tensor, x: torch.Tensor, card: DatasetCard,
                adj: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """``h`` propagated over the learned Gram relation. ``[B,N,hidden]`` in and out.
+        """``H0`` propagated over every relation and fused. ``[B,N,hidden]`` in and out.
 
-        The only relation SHAPE has today. A second one (the physical graph) is
-        a sibling of this method, not an extra term inside it.
+        This is eq:relation-fusion: each relation is an independently
+        parameterised sibling, never an extra term summed into one adjacency.
         """
-        h = self.pre_mp_norm(h)
-        if self.relations != "legacy":
-            return self.rel_fusion(h, [self._relation(r, h, x, card, adj) for r in self.rel_names])
-
-        # Message passing runs on the Gram sub-block. Nodes outside it keep the
-        # embedding they arrived with -- no edges, so no messages.
-        if self.ablate != "no_graph":
-            for nodes in self.gram_chunks(x, card):           # each [K], K <= budget
-                pooled = self._message_pass(h.index_select(1, nodes))   # [B, K, hidden]
-                h = h.index_copy(1, nodes, pooled)            # [B, N, hidden]
-        return h
+        h = self.pre_mp_norm(h)                               # eq:h0
+        return self.rel_fusion(h, [self._relation(r, h, x, card, adj)
+                                   for r in self.rel_names])
 
     def _relation(self, name: str, h: torch.Tensor, x: torch.Tensor,
                   card: DatasetCard,
@@ -513,37 +471,34 @@ class Shape(nn.Module):
         """One relation's view of ``h``, or ``None`` if this corpus lacks it."""
         block = self.rel_blocks[name]
         if name == "gram":
-            # Same node budgeting as the legacy path: the Gram graph is dense over
-            # whatever enters it, so training samples a block and evaluation walks
-            # the eligible set in chunks.
+            # The Gram graph is dense over whatever enters it, so training samples
+            # a node block and evaluation walks the eligible set in chunks.
             z = h
             for nodes in self.gram_chunks(x, card):
                 sub = h.index_select(1, nodes)                 # [B, K, hidden]
                 z = z.index_copy(1, nodes, block(sub, self.gram_graph(sub)))
             return z
-        if name == "ident":
-            # The same block over the identity adjacency: every node sees only
-            # itself. Separates "message passing carries information" from "the
-            # relation block adds depth and parameters", which the `none` arm
-            # confounds because it removes both at once.
-            eye = torch.eye(h.shape[1], device=h.device, dtype=h.dtype)
-            return block(h, eye.unsqueeze(0).expand(h.shape[0], -1, -1))
-        if name == "dyn":
-            # The corpus's own topology at this window, which unlike phys is not a
-            # constant of the corpus: it arrives with the batch because it changes
-            # every snapshot. A corpus without edges contributes m_dyn,d = 0.
-            if adj is None or adj.shape[-1] != h.shape[1]:
+        if name == "gramx":
+            # Same block and same node walk as `gram`; only the operator's source
+            # differs, so the two arms isolate self-referential vs input-built.
+            z = h
+            for nodes in self.gram_chunks(x, card):
+                sub = h.index_select(1, nodes)                 # [B, K, hidden]
+                z = z.index_copy(1, nodes, block(sub, self.input_graph(x, nodes)))
+            return z
+        if name == "topo":
+            # The corpus's own topology at this window. It arrives with the batch
+            # rather than being stored, so it is defined on a corpus never seen and
+            # follows an evolving graph. A corpus without edges gives m_dyn,d = 0.
+            # Dense is [B,N,N]; sparse is block-diagonal [B*N, B*N]. Either way
+            # the operator must address exactly the nodes h carries.
+            if adj is None:
+                return None
+            n = h.shape[1] if not adj.is_sparse else h.shape[0] * h.shape[1]
+            if adj.shape[-1] != n:
                 return None
             return block(h, adj.to(h.dtype))
-        adj = getattr(self, f"phys_{card.name}", None) if card.name in self._phys else None
-        if adj is None:
-            return None                                        # m_phys,d = 0
-        # The physical graph is over the corpus's full node set; a batch that was
-        # densified to a node subset carries its own ids, which this stage does not
-        # see, so it only applies when the batch is the full node set.
-        if adj.shape[0] != h.shape[1]:
-            return None
-        return block(h, adj.unsqueeze(0).expand(h.shape[0], -1, -1).to(h.dtype))
+        raise ValueError(f"unknown relation {name!r}")
 
     # --------------------------------------------------------------- backbone
 
@@ -614,8 +569,6 @@ class Shape(nn.Module):
             if isinstance(head, InformedGraphHead):
                 if deg is None:
                     raise ValueError(f"{card.name}: informed readout needs degree features")
-                if self.ablate == "degrees_only":
-                    graph_h = torch.zeros_like(graph_h)
                 return head(graph_h, deg).float()               # [B, 1]
             return head(graph_h).float()                        # [B, 1]
         out = self.heads[head_key(card)](h)                   # [B, N, H_MAX] or [B, N, num_classes]
@@ -626,12 +579,30 @@ class Shape(nn.Module):
     # ----------------------------------------------------------------- forward
 
     def forward(self, x, edge_index=None, edge_weight=None, u=None, u_mask=None,
-                x_tsfm=None, pe=None, mask=None, *, card: DatasetCard,
+                pe=None, mask=None, *, card: DatasetCard,
                 num_nodes: Optional[int] = None, deg: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """The 8-slot contract. ``x_tsfm``/``pe``/``mask`` are accepted and unused
-        at this stage; ``edge_index``/``edge_weight`` feed the ``dyn`` relation."""
-        adj = (dense_adj(edge_index, edge_weight, x.shape[1], x.device, x.dtype)
-               if edge_index is not None and "dyn" in self.rel_names else None)
+        """``pe``/``mask`` are accepted and unused
+        at this stage; ``edge_index``/``edge_weight`` feed the ``topo`` relation."""
+        if ("topo" in self.rel_names and edge_index is None
+                and (self.training or card.static_topology)):
+            # A dropped edge_index makes the topology block contribute exact
+            # zeros: its fusion slot never leaves its zero init and the run is
+            # numerically `gram` alone while every log still says two relations.
+            # That has happened here, so it fails loudly wherever a graph must
+            # exist -- always in training, and at inference whenever the card
+            # declares a topology. A user forecasting a bare series through
+            # `predict.forecast` legitimately has none, and for them the relation
+            # contributes zeros as eq:relation-fusion allows.
+            raise ValueError(
+                f"{card.name}: relation 'topo' is declared but the batch carries no "
+                "edge_index. The topology branch would be silently dead and the run "
+                "would not implement eq:relation-fusion. Check the collate function.")
+        adj = None
+        if edge_index is not None and "topo" in self.rel_names:
+            n = x.shape[1]
+            build = (dense_adj if len(edge_index) * n * n <= DENSE_ADJ_MAX
+                     else sparse_adj)
+            adj = build(edge_index, edge_weight, n, x.device, x.dtype)
         z = self.encode(x, u, u_mask, card=card, adj=adj, pe=pe)   # [B, N, hidden]
         return self.head_forward(z, x, card=card, num_nodes=num_nodes, deg=deg)
 
@@ -656,6 +627,22 @@ class Shape(nn.Module):
             mean = series.mean(dim=-1, keepdim=True)              # [B, N, 1]
             std = series.std(dim=-1, keepdim=True).clamp(min=1e-5)  # [B, N, 1]
             return out.float() * std + mean
+
+
+def fusion_slot_masses(model: "Shape") -> Dict[str, float]:
+    """``|W_c|`` summed per slot of eq:relation-fusion, as ``{slot: mass}``.
+
+    A relation whose branch never receives a non-zero input gets no gradient, so
+    its slot stays at the exact zero it was initialised to. That has happened
+    here before -- a collate function dropped ``edge_index`` and the topology
+    branch was numerically absent while every log still claimed two relations --
+    and this is the cheapest direct test for it. Recorded at save time.
+    """
+    w = model.rel_fusion.proj.weight.detach()                   # [d, (R+1)d]
+    d = model.hidden_dim
+    slots = ["H0"] + list(model.rel_names)
+    return {name: float(w[:, i * d:(i + 1) * d].abs().sum())
+            for i, name in enumerate(slots)}
 
 
 def loss_for(card: DatasetCard, pred: torch.Tensor, y: torch.Tensor,

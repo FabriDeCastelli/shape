@@ -35,8 +35,8 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from torch.utils.data import DataLoader, Dataset
 
 from shape.data import DatasetCard, ShapeDataset
-from shape.model import Shape, loss_for
-from shape.relations import physical_adjacency
+from shape.model import Shape, fusion_slot_masses, loss_for
+from shape.tracking import finish as wandb_finish, wandb_logger
 from shape.packs import collate_pack
 from shape.train import PRECISION, configure_backends, metrics_for
 
@@ -248,11 +248,10 @@ class PretrainTask(L.LightningModule):
 
     def __init__(self, corpus: MultiCorpus, base: Dict[str, float], lr: float,
                  weight_decay: float, hidden: int, layers: int, eval_chunk: int = 0,
-                 freeze_trunk: bool = False, relations: str = "legacy",
-                 use_scale: bool = False, phys_adj=None, scale_shared: bool = False,
+                 freeze_trunk: bool = False, relations: str = "gram+topo",
                  patch_len: int = 0, use_covariates: bool = False,
-                 rel_gate: bool = False, rel_inject: bool = False,
-                 soft_topk: bool = False, attn_depth: int = 0,
+                 rel_gate: bool = True, layer_agg: bool = True,
+                 attn_depth: int = 2,
                  pe_readout: bool = False, window_scales=()):
         super().__init__()
         self.base = base
@@ -263,12 +262,10 @@ class PretrainTask(L.LightningModule):
         self.masks = {f: {n: corpus.node_mask(n, f) for n in corpus.names}
                       for f in ("train", "val", "test")}
         self.model = Shape(corpus.cards, hidden_dim=hidden, num_layers=layers,
-                           eval_chunk=eval_chunk, relations=relations,
-                           use_scale=use_scale, phys_adj=phys_adj,
-                           scale_shared=scale_shared, patch_len=patch_len,
+                           eval_chunk=eval_chunk, relations=relations, patch_len=patch_len,
                            use_covariates=use_covariates, rel_gate=rel_gate,
-                           rel_inject=rel_inject, soft_topk=soft_topk,
-                           attn_depth=attn_depth, pe_readout=pe_readout)
+                           layer_agg=layer_agg, attn_depth=attn_depth,
+                           pe_readout=pe_readout)
         if freeze_trunk:
             for name, p in self.model.named_parameters():
                 p.requires_grad = name.startswith("heads.")
@@ -279,6 +276,8 @@ class PretrainTask(L.LightningModule):
         name = batch["network"]
         card = self.cards[name]
         pred = self.model(batch["x"], pe=batch.get("pe"),
+                          edge_index=batch.get("edge_index"),
+                          edge_weight=batch.get("edge_weight"),
                           u=batch["u"], u_mask=batch["u_mask"], card=card,
                           num_nodes=batch.get("num_nodes"), deg=batch.get("deg"))
         y, mask = batch["y"], batch["mask"]
@@ -367,11 +366,9 @@ def measure_baselines(names, root=None, cache="runs/phase02/baselines.json") -> 
 def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, layers,
              weight_decay, precision, root=None, num_workers=2, eval_chunk=0,
              freeze_trunk=False, init_from=None, tag="joint",
-             relations="legacy", use_scale=False, batch=0,
-             phys_weight="binary", scale_shared=False, patch_len=0,
-             domain_balance=False, covariates=False, rel_gate=False,
-             rel_inject=False, soft_topk=False, attn_depth=0,
-             pe_readout=False, window_scales=()) -> Dict:
+             relations="gram+topo", batch=0, patch_len=12,
+             domain_balance=False, covariates=False, rel_gate=True, attn_depth=2,
+             layer_agg=True, pe_readout=False, window_scales=()) -> Dict:
     configure_backends(precision)
     L.seed_everything(seed, workers=True, verbose=False)
     run_dir = os.path.join(out_dir, tag, f"seed{seed}")
@@ -379,19 +376,6 @@ def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, la
     if os.path.exists(done):
         raise SystemExit(f"{done} exists -- refusing to overwrite a finished run.")
     os.makedirs(run_dir, exist_ok=True)
-
-    phys_adj = None
-    if "phys" in relations:
-        phys_adj = {}
-        for n in names:
-            ds = ShapeDataset(n, **({} if root is None else {"root": root}))
-            if not ds.card.static_topology:
-                continue
-            adj = physical_adjacency(*ds._edges_at(0), ds.card.num_nodes, phys_weight)
-            if adj is not None:
-                phys_adj[n] = adj
-        print(f"  phys adjacency for {sorted(phys_adj)} "
-              f"(missing: {sorted(set(names) - set(phys_adj))})", flush=True)
 
     base = measure_baselines(names, root)
     fold_batch = {n: batch or batch_for(n) for n in names}
@@ -410,10 +394,8 @@ def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, la
         caps = cap or None
     dl, train_ds = loaders(names, fold_batch, caps, seed, root, num_workers, use_pe=pe_readout)
     task = PretrainTask(train_ds, base, lr, weight_decay, hidden, layers, eval_chunk,
-                        freeze_trunk, relations, use_scale, phys_adj, scale_shared,
-                        patch_len, use_covariates=covariates, rel_gate=rel_gate,
-                        rel_inject=rel_inject, soft_topk=soft_topk,
-                        attn_depth=attn_depth, pe_readout=pe_readout,
+                        freeze_trunk, relations, patch_len, use_covariates=covariates, rel_gate=rel_gate,
+                        layer_agg=layer_agg, attn_depth=attn_depth, pe_readout=pe_readout,
                         window_scales=window_scales)
     if init_from:
         state = torch.load(init_from, map_location="cpu", weights_only=False)["state_dict"]
@@ -427,17 +409,27 @@ def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, la
         torch.cuda.reset_peak_memory_stats(device)
     best = ModelCheckpoint(dirpath=run_dir, filename="best", monitor="val_macro",
                            mode="min", save_top_k=1, enable_version_counter=False)
+    wb = wandb_logger(f"{tag}-seed{seed}", group=tag, config=dict(
+        protocol="loo", corpora=list(names), n_corpora=len(names), seed=seed,
+        hidden=hidden, layers=layers, lr=lr, cap=cap, relations=relations,
+        rel_gate=rel_gate, patch_len=patch_len, attn_depth=attn_depth,
+        layer_agg=layer_agg,
+        precision=precision))
     trainer = L.Trainer(
         max_epochs=epochs, accelerator=accelerator, devices=devices,
         precision=PRECISION[precision], gradient_clip_val=5.0, num_sanity_val_steps=0,
         callbacks=[EarlyStopping("val_macro", mode="min", patience=patience,
                                  min_delta=1e-5), best],
-        logger=False, enable_progress_bar=False, enable_model_summary=False)
+        logger=wb or False, enable_progress_bar=False, enable_model_summary=False)
     t0 = time.time()
     trainer.fit(task, dl["train"], dl["val"])
     trainer.test(task, dl["test"], ckpt_path=best.best_model_path, verbose=False)
+    wandb_finish()
 
     row = {"corpora": list(names), "n_corpora": len(names), "seed": seed, "tag": tag,
+           "protocol": "loo",
+           # A relation whose branch stayed dead leaves its slot at exact zero.
+           "fusion_slots": fusion_slot_masses(task.model),
            "epochs_run": trainer.current_epoch, "cap": cap,
            "val_macro": float(best.best_model_score) if best.best_model_score is not None else float("nan"),
            "checkpoint": best.best_model_path, "baselines": base, "batch": fold_batch,
@@ -445,11 +437,9 @@ def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, la
            "max_epochs": epochs, "precision": precision, "eval_chunk": eval_chunk,
            "window_scales": list(window_scales),
            "freeze_trunk": freeze_trunk, "init_from": init_from,
-           "relations": relations, "scale": use_scale,
-           "phys_weight": phys_weight, "phys_corpora": sorted(phys_adj or {}),
-           "scale_shared": scale_shared, "patch_len": patch_len,
+           "relations": relations, "patch_len": patch_len,
            "domain_balance": domain_balance, "covariates": covariates,
-           "rel_gate": rel_gate, "rel_inject": rel_inject, "soft_topk": soft_topk,
+           "rel_gate": rel_gate, "layer_agg": layer_agg,
            "attn_depth": attn_depth, "pe_readout": pe_readout,
            # Recorded, not assumed: a probe that silently trained the trunk would
            # answer a different question than the one asked.
@@ -460,6 +450,9 @@ def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, la
            "peak_mem_mb": (round(torch.cuda.max_memory_allocated(device) / 2 ** 20, 1)
                            if device != "cpu" and torch.cuda.is_available() else 0.0),
            "metrics": task.metrics}
+    for r in task.model.rel_names:
+        assert row["fusion_slots"][r] > 0, (
+            f"relation {r!r} never left its zero init: its branch was dead all run")
     json.dump(row, open(done, "w"), indent=2)
     return row
 
@@ -490,17 +483,18 @@ if __name__ == "__main__":
     ap.add_argument("--freeze-trunk", action="store_true",
                     help="train the heads only: the frozen linear probe")
     ap.add_argument("--init-from", default=None, help="checkpoint to start from")
-    ap.add_argument("--relations", default="legacy")
-    ap.add_argument("--scale", action="store_true")
+    ap.add_argument("--no-layer-agg", dest="layer_agg", action="store_false",
+                    help="read H^(L) only instead of eq:pi (ablation arm)")
+    ap.add_argument("--relations", default="gram+topo",
+                    help="default is \\MODEL{} as defined in the paper: the learned\n"
+                         "Gram relation plus the observed topology. Ablation values:\n"
+                         "gram | topo | ident | none.")
     ap.add_argument("--domain-balance", action="store_true",
                     help="give each domain (flow | speed | graph) an equal share of "
                          "the epoch; --cap is then the total batches per epoch")
-    ap.add_argument("--patch-len", type=int, default=0,
+    ap.add_argument("--patch-len", type=int, default=12,
                     help="patch the input window instead of a flat Linear(W,.); "
                          "0 = off. Non-zero is what allows mixed W across corpora.")
-    ap.add_argument("--scale-shared", action="store_true",
-                    help="one [mu,sigma] projection for every corpus; required for zero-shot")
-    ap.add_argument("--phys-weight", choices=["binary", "gaussian"], default="binary")
     ap.add_argument("--batch", type=int, default=0,
                     help="one batch size for every corpus, overriding BATCH")
     ap.add_argument("--covariates", action="store_true",
@@ -508,14 +502,12 @@ if __name__ == "__main__":
                          "they are derived from the card's start_date and freq, so no "
                          "corpus rebuild is needed, and they are not node-indexed, so "
                          "they transfer to an unseen network")
-    ap.add_argument("--rel-gate", action="store_true",
+    ap.add_argument("--no-rel-gate", dest="rel_gate", action="store_false",
+                    help="disable eq:relation-gate (ablation only; on by default)")
+    ap.add_argument("--rel-gate", dest="rel_gate", action="store_true", default=True,
                     help="gate the aggregated message per node and channel, so a "
                          "relation that is absent on an unseen corpus can be discounted")
-    ap.add_argument("--rel-inject", action="store_true",
-                    help="re-inject f(X) at every propagation layer")
-    ap.add_argument("--soft-topk", action="store_true",
-                    help="learned magnitude threshold instead of a fixed top-k")
-    ap.add_argument("--attn-depth", type=int, default=0,
+    ap.add_argument("--attn-depth", type=int, default=2,
                     help="causal self-attention layers over the patch sequence; needs --patch-len")
     ap.add_argument("--pe-readout", action="store_true",
                     help="modulate the readout by the supra-Laplacian positional "
@@ -527,9 +519,8 @@ if __name__ == "__main__":
         r = pretrain(a.corpora, seed, a.out, a.epochs, a.cap, a.lr, a.patience, a.device,
                      a.hidden, a.layers, a.weight_decay, a.precision, a.root,
                      a.num_workers, a.eval_chunk, a.freeze_trunk, a.init_from, a.tag,
-                     a.relations, a.scale, a.batch, a.phys_weight, a.scale_shared,
-                     a.patch_len, a.domain_balance, a.covariates,
-                     a.rel_gate, a.rel_inject, a.soft_topk, a.attn_depth, a.pe_readout,
+                     a.relations, a.batch, a.patch_len, a.domain_balance, a.covariates,
+                     a.rel_gate, a.attn_depth, a.layer_agg, a.pe_readout,
                      a.window_scales)
         print(f"\n{a.tag} seed{seed}  val_macro {r['val_macro']:.4f}  "
               f"{r['epochs_run']} ep  {r['seconds']:.0f}s", flush=True)

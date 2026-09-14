@@ -27,8 +27,8 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from torch.utils.data import DataLoader, Subset
 
 from shape.data import DatasetCard, ShapeDataset, densify_union
-from shape.model import Shape, loss_for
-from shape.relations import physical_adjacency
+from shape.model import Shape, fusion_slot_masses, loss_for
+from shape.tracking import finish as wandb_finish, wandb_logger
 
 # One summary line per dataset is the whole output contract; Lightning's INFO
 # banner would put an accelerator report between every seed, and its
@@ -153,9 +153,9 @@ class ShapeTask(L.LightningModule):
     def __init__(self, card: DatasetCard, node_masks: Dict[str, Optional[torch.Tensor]],
                  lr: float, weight_decay: float, hidden: int, layers: int,
                  use_covariates: bool, eval_chunk: int = 0, fuse: str = "mean",
-                 relations: str = "legacy", phys_adj=None, use_scale: bool = False,
-                 scale_shared: bool = False, patch_len: int = 0,
-                 attn_depth: int = 0, rel_gate: bool = False, rel_inject: bool = False,
+                 relations: str = "gram+topo",
+                 patch_len: int = 12,
+                 attn_depth: int = 2, rel_gate: bool = True, layer_agg: bool = True,
                  covariate_readout: bool = False):
         super().__init__()
         self.card = card
@@ -163,10 +163,9 @@ class ShapeTask(L.LightningModule):
         self.lr, self.weight_decay = lr, weight_decay
         self.model = Shape([card], hidden_dim=hidden, num_layers=layers,
                            use_covariates=use_covariates, eval_chunk=eval_chunk, fuse=fuse,
-                           relations=relations, phys_adj=phys_adj, use_scale=use_scale,
-                           scale_shared=scale_shared, patch_len=patch_len,
-                           attn_depth=attn_depth, rel_gate=rel_gate, rel_inject=rel_inject,
-                           covariate_readout=covariate_readout)
+                           relations=relations, patch_len=patch_len,
+                           attn_depth=attn_depth, rel_gate=rel_gate,
+                           layer_agg=layer_agg, covariate_readout=covariate_readout)
         self.test_out: List[Dict] = []
 
     def step(self, batch, fold: str):
@@ -251,31 +250,17 @@ def train_one(name: str, seed: int, epochs: int, batch_size: int, lr: float,
               precision: str = "bf16", eval_chunk: int = 0,
               eval_batch_size: int = 0, fuse: str = "mean",
               shuffle: bool = False, ckpt_dir: Optional[str] = None,
-              limit_train_batches: int = 0, relations: str = "legacy",
-              phys_weight: str = "binary", use_scale: bool = False,
-              scale_shared: bool = False, patch_len: int = 0,
-              attn_depth: int = 0, rel_gate: bool = False,
-              rel_inject: bool = False, covariate_readout: bool = False,
-              num_workers: int = 0) -> Dict:
+              limit_train_batches: int = 0, relations: str = "gram+topo",
+              patch_len: int = 12,
+              attn_depth: int = 2, rel_gate: bool = True, layer_agg: bool = True,
+              covariate_readout: bool = False, num_workers: int = 0) -> Dict:
     configure_backends(precision)
     L.seed_everything(seed, workers=True, verbose=False)
     ds = ShapeDataset(name)
     card = ds.card
     dl, nodes = loaders(ds, batch_size, eval_batch_size, shuffle, seed, num_workers)
-    # The physical graph is a constant of the corpus (static_topology), so it is
-    # built once here rather than travelling with every batch.
-    phys_adj = None
-    if "phys" in relations:
-        if not card.static_topology:
-            raise SystemExit(f"{name}: relations={relations!r} needs a static topology")
-        ei, ew = ds._edges_at(0)
-        adj = physical_adjacency(ei, ew, card.num_nodes, phys_weight)
-        if adj is None:
-            raise SystemExit(f"{name}: no physical edges to build a relation from")
-        phys_adj = {card.name: adj}
     task = ShapeTask(card, nodes, lr, weight_decay, hidden, layers, use_covariates,
-                     eval_chunk, fuse, relations, phys_adj, use_scale, scale_shared,
-                     patch_len, attn_depth, rel_gate, rel_inject, covariate_readout)
+                     eval_chunk, fuse, relations, patch_len, attn_depth, rel_gate, layer_agg, covariate_readout)
 
     accelerator, devices = ("cpu", 1) if device == "cpu" else ("gpu", [int(device.split(":")[1])])
     if device != "cpu" and torch.cuda.is_available():
@@ -291,6 +276,11 @@ def train_one(name: str, seed: int, epochs: int, batch_size: int, lr: float,
     with (contextlib.nullcontext(ckpt_dir) if keep else tempfile.TemporaryDirectory()) as d:
         best = ModelCheckpoint(dirpath=d, monitor="val_loss", mode="min", save_top_k=1,
                                filename=f"{name}-seed{seed}", enable_version_counter=False)
+        wb = wandb_logger(f"{name}-seed{seed}", group=f"sup-{name}", config=dict(
+            protocol="sup", corpora=[name], seed=seed, hidden=hidden, layers=layers,
+            lr=lr, batch_size=batch_size, relations=relations, rel_gate=rel_gate,
+            patch_len=patch_len, attn_depth=attn_depth, W=card.W, H=card.H,
+            precision=precision))
         trainer = L.Trainer(
             max_epochs=epochs, accelerator=accelerator, devices=devices,
             precision=PRECISION[precision],
@@ -299,26 +289,37 @@ def train_one(name: str, seed: int, epochs: int, batch_size: int, lr: float,
             limit_train_batches=limit_train_batches or 1.0,
             gradient_clip_val=5.0, num_sanity_val_steps=0,
             callbacks=[EarlyStopping("val_loss", min_delta=1e-6, patience=patience, mode="min"), best],
-            logger=False, enable_progress_bar=False, enable_model_summary=False,
+            logger=wb or False, enable_progress_bar=False, enable_model_summary=False,
         )
         trainer.fit(task, dl["train"], dl["val"])
         # Score the best epoch, not the last one the stopper happened to reach.
         trainer.test(task, dl["test"], ckpt_path=best.best_model_path, verbose=False)
         val_loss = float(best.best_model_score) if best.best_model_score is not None else math.inf
+    wandb_finish()
 
-    return {"dataset": name, "seed": seed, "metric": card.metric,
+    row = {"dataset": name, "seed": seed, "metric": card.metric,
             "epochs": trainer.current_epoch,
             "hidden": hidden, "layers": layers, "lr": lr, "weight_decay": weight_decay,
             "covariates": use_covariates, "revin": task.model.revin, "batch_size": batch_size,
             "precision": precision, "fuse": fuse, "shuffle": shuffle,
             "limit_train_batches": limit_train_batches,
-            "relations": relations, "phys_weight": phys_weight, "scale": use_scale,
-            "scale_shared": scale_shared, "patch_len": patch_len,
-            "attn_depth": attn_depth, "rel_gate": rel_gate, "rel_inject": rel_inject,
+            "relations": relations, "patch_len": patch_len,
+            "attn_depth": attn_depth, "rel_gate": rel_gate, "layer_agg": layer_agg,
             "covariate_readout": covariate_readout,
             "checkpoint": best.best_model_path if keep else None,
+           "corpora": [name], "protocol": "sup", "W": card.W, "H": card.H,
+           # A relation whose branch stayed dead leaves its slot at exact zero.
+           "fusion_slots": fusion_slot_masses(task.model),
             "val_loss": val_loss, "seconds": round(time.time() - t0, 1),
             "peak_mem_mb": _peak_mem_mb(device), **task.metrics}
+    for r in task.model.rel_names:
+        assert row["fusion_slots"][r] > 0, (
+            f"relation {r!r} never left its zero init: its branch was dead all run")
+    # The checkpoint has to carry its own config, or nothing downstream can
+    # rebuild the model that produced it.
+    if keep:
+        json.dump(row, open(os.path.join(ckpt_dir, "train.json"), "w"), indent=2)
+    return row
 
 
 def _peak_mem_mb(device: str) -> float:
@@ -340,13 +341,13 @@ if __name__ == "__main__":
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--covariates", action="store_true")
-    ap.add_argument("--attn-depth", type=int, default=0,
+    ap.add_argument("--attn-depth", type=int, default=2,
                     help="causal self-attention layers over the patch sequence; "
                          "0 = the order-free pooled encoder. Needs --patch-len")
-    ap.add_argument("--rel-gate", action="store_true",
+    ap.add_argument("--no-rel-gate", dest="rel_gate", action="store_false",
+                    help="disable eq:relation-gate (ablation only; on by default)")
+    ap.add_argument("--rel-gate", dest="rel_gate", action="store_true", default=True,
                     help="gate the aggregated message per node and channel")
-    ap.add_argument("--rel-inject", action="store_true",
-                    help="re-inject f(X) at every propagation layer")
     ap.add_argument("--num-workers", type=int, default=0,
                     help="dataloader workers; windowing happens in __getitem__, so 0 "
                          "cuts every batch in the main process while the device waits")
@@ -364,18 +365,14 @@ if __name__ == "__main__":
     ap.add_argument("--fuse", choices=["mean", "attn"], default="mean",
                     help="how per-source node embeddings combine: unweighted "
                          "mean (original) or a learned query over source tokens")
-    ap.add_argument("--patch-len", type=int, default=0,
+    ap.add_argument("--patch-len", type=int, default=12,
                     help="patch the input window instead of a flat Linear(W,.); 0 = off")
-    ap.add_argument("--scale-shared", action="store_true",
-                    help="one [mu,sigma] projection for every corpus; required for zero-shot")
-    ap.add_argument("--scale", action="store_true",
-                    help="add projected per-window [mean, std] as a source (Phi_scale)")
-    ap.add_argument("--relations", default="legacy",
-                    help="legacy (the pre-Phase-03 inline Gram loop), or a '+'-joined "
-                         "subset of {gram,phys} routed through independent blocks")
-    ap.add_argument("--phys-weight", choices=["binary", "gaussian"], default="binary",
-                    help="edge weighting for the physical relation; the stored weight "
-                         "is a road distance, so 'gaussian' turns it into a similarity")
+    ap.add_argument("--no-layer-agg", dest="layer_agg", action="store_false",
+                    help="read H^(L) only instead of eq:pi (ablation arm)")
+    ap.add_argument("--relations", default="gram+topo",
+                    help="default is \\MODEL{} as defined in the paper: the learned\n"
+                         "Gram relation plus the observed topology. Ablation values:\n"
+                         "gram | topo | ident | none.")
     ap.add_argument("--limit-train-batches", type=int, default=0,
                     help="train on at most this many batches per epoch (0 = all)")
     ap.add_argument("--ckpt-dir", default=None,
@@ -391,11 +388,9 @@ if __name__ == "__main__":
             r = train_one(name, seed, a.epochs, a.batch_size, a.lr, a.patience,
                           a.device, a.hidden, a.layers, a.covariates, a.weight_decay,
                           a.precision, a.eval_chunk, a.eval_batch_size, a.fuse, a.shuffle,
-                          a.ckpt_dir, a.limit_train_batches, a.relations, a.phys_weight, a.scale,
-                          a.scale_shared, a.patch_len,
+                          a.ckpt_dir, a.limit_train_batches, a.relations, a.patch_len,
                           attn_depth=a.attn_depth, rel_gate=a.rel_gate,
-                          rel_inject=a.rel_inject,
-                          covariate_readout=a.covariate_readout,
+                          layer_agg=a.layer_agg, covariate_readout=a.covariate_readout,
                           num_workers=a.num_workers)
             rows.append(r)
             if a.out:
@@ -409,7 +404,7 @@ if __name__ == "__main__":
                                                "val_loss", "seconds", "precision", "fuse",
                                                "shuffle", "checkpoint",
                                                "limit_train_batches", "relations",
-                                               "phys_weight", "scale")
+                                               "scale")
                 and isinstance(rows[0][k], (int, float)) and not isinstance(rows[0][k], bool)]
         summary = "  ".join(
             f"{k} {sum(r[k] for r in rows) / len(rows):.4f}"

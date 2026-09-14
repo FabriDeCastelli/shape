@@ -40,8 +40,8 @@ class PackTask(L.LightningModule):
     """Shared backbone over a pack, scored by macro val AUC."""
 
     def __init__(self, pack: PackDataset, lr: float, weight_decay: float,
-                 hidden: int, layers: int, ablate: str = "none", readout: str = "linear",
-                 relations: str = "legacy", top_k: int = 20, dropout: float = 0.1,
+                 hidden: int, layers: int, readout: str = "linear",
+                 relations: str = "gram+topo", top_k: int = 20, dropout: float = 0.1,
                  window: int = 0, patch_len: int = 0, attn_depth: int = 0):
         super().__init__()
         self.pack = pack
@@ -50,7 +50,7 @@ class PackTask(L.LightningModule):
         # precomputed per snapshot, so shortening the input changes what the model
         # reads without touching what it predicts.
         self.window = window
-        self.model = Shape(pack.cards, hidden_dim=hidden, num_layers=layers, ablate=ablate,
+        self.model = Shape(pack.cards, hidden_dim=hidden, num_layers=layers,
                            readout=readout, relations=relations, top_k=top_k,
                            dropout=dropout, patch_len=patch_len, attn_depth=attn_depth)
         self.cards = {c.name: c for c in pack.cards}
@@ -61,6 +61,8 @@ class PackTask(L.LightningModule):
         if self.window:
             batch = {**batch, "x": batch["x"][..., -self.window:, :]}
         pred = self.model(batch["x"], u=batch["u"], u_mask=batch["u_mask"], card=card,
+                          edge_index=batch.get("edge_index"),
+                          edge_weight=batch.get("edge_weight"),
                           num_nodes=batch.get("num_nodes"), deg=batch.get("deg"))
         return pred, loss_for(card, pred, batch["y"], batch["mask"])
 
@@ -141,8 +143,8 @@ def train_pack(pack: str, seed: int, out_dir: str, epochs: int, batch_size: int,
                lr: float, patience: int, device: str, hidden: int, layers: int,
                weight_decay: float, precision: str, root: str | None = None,
                num_workers: int = 6, eval_batch_size: int = 8,
-               ablate: str = "none", readout: str = "linear",
-               overwrite: bool = False, relations: str = "legacy",
+               readout: str = "linear",
+               overwrite: bool = False, relations: str = "gram+topo",
                top_k: int = 20, dropout: float = 0.1, window: int = 0,
                patch_len: int = 0, attn_depth: int = 0) -> Dict:
     configure_backends(precision)
@@ -151,7 +153,7 @@ def train_pack(pack: str, seed: int, out_dir: str, epochs: int, batch_size: int,
     # Numeric packs keep the zero-padded name the scaling runs used; a named
     # pack (a domain split, say) keeps its own name.
     stem = f"pack{int(pack):02d}" if pack.isdigit() else f"pack-{pack}"
-    tag = (stem + ("" if ablate == "none" else f"-{ablate}")
+    tag = (stem
            # The suffix names the directory layout the overnight run established
            # (informed unsuffixed, everything else suffixed), NOT the current
            # default. Tying it to the default would make a new linear run write
@@ -171,7 +173,7 @@ def train_pack(pack: str, seed: int, out_dir: str, epochs: int, batch_size: int,
                          f"Pass --overwrite, or --out a different directory.")
     os.makedirs(run_dir, exist_ok=True)
     dl, train_ds = loaders(networks, batch_size, seed, root, num_workers, eval_batch_size)
-    task = PackTask(train_ds, lr, weight_decay, hidden, layers, ablate, readout,
+    task = PackTask(train_ds, lr, weight_decay, hidden, layers, readout,
                     relations, top_k, dropout, window, patch_len, attn_depth)
 
     accelerator, devices = ("cpu", 1) if device == "cpu" else ("gpu", [int(device.split(":")[1])])
@@ -198,7 +200,7 @@ def train_pack(pack: str, seed: int, out_dir: str, epochs: int, batch_size: int,
            "val_auc": float(best.best_model_score) if best.best_model_score is not None else float("nan"),
            "checkpoint": best.best_model_path,
            "hidden": hidden, "layers": layers, "lr": lr, "weight_decay": weight_decay,
-           "batch_size": batch_size, "eval_batch_size": eval_batch_size, "ablate": ablate, "readout": readout,
+           "batch_size": batch_size, "eval_batch_size": eval_batch_size, "readout": readout,
            "relations": relations,
            "max_epochs": epochs, "precision": precision,
            "train_windows": len(train_ds),
@@ -227,7 +229,6 @@ if __name__ == "__main__":
     ap.add_argument("--root", default=None)
     ap.add_argument("--num-workers", type=int, default=6)
     ap.add_argument("--eval-batch-size", type=int, default=8)
-    ap.add_argument("--ablate", choices=["none", "degrees_only", "no_graph"], default="none")
     ap.add_argument("--overwrite", action="store_true",
                     help="allow writing into a run directory that already holds a finished run")
     ap.add_argument("--readout", choices=["informed", "linear"], default="informed")
@@ -239,16 +240,17 @@ if __name__ == "__main__":
     ap.add_argument("--attn-depth", type=int, default=0)
     ap.add_argument("--window", type=int, default=0,
                     help="keep only the newest W snapshots of the input; 0 = the card's W")
-    ap.add_argument("--relations", default="legacy",
-                    help="legacy | gram | gram+phys. MiNT has no static topology, so\n"
-                         "gram is the only relation available here.")
+    ap.add_argument("--relations", default="gram+topo",
+                    help="default is \\MODEL{} as defined in the paper: the learned\n"
+                         "Gram relation plus the observed topology. Ablation values:\n"
+                         "gram | topo | ident | none.")
     a = ap.parse_args()
 
     for pack in a.packs:
         for seed in a.seeds:
             r = train_pack(pack, seed, a.out, a.epochs, a.batch_size, a.lr, a.patience,
                            a.device, a.hidden, a.layers, a.weight_decay, a.precision, a.root,
-                           a.num_workers, a.eval_batch_size, a.ablate, a.readout,
+                           a.num_workers, a.eval_batch_size, a.readout,
                            a.overwrite, a.relations, a.top_k, a.dropout, a.window,
                            a.patch_len, a.attn_depth)
             print(f"pack{r['pack']} seed{r['seed']}  val_auc {r['val_auc']:.4f}  "
