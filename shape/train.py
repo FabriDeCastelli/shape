@@ -27,8 +27,10 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from torch.utils.data import DataLoader, Subset
 
 from shape.data import DatasetCard, ShapeDataset, densify_union
+from shape.packs import _remap_edges
 from shape.model import Shape, fusion_slot_masses, loss_for
-from shape.tracking import finish as wandb_finish, wandb_logger
+from shape.tracking import (finish as wandb_finish, wandb_logger,
+                            experiment_name, log_test)
 
 # One summary line per dataset is the whole output contract; Lightning's INFO
 # banner would put an accelerator report between every seed, and its
@@ -85,6 +87,14 @@ def collate(items: List[Dict]) -> Dict:
     compact = densify_union(items)
     if compact is not None:
         out["x"], out["node_ids"], out["num_nodes"], out["pe"] = compact   # [B, K, W, C]
+        # densify_union reindexes the nodes into the batch union, so the edge
+        # lists must follow. Without this the raw global ids address the wrong
+        # pairs, and index out of the [B,K,K] adjacency as soon as any id
+        # exceeds the size of the union. collate_pack has always done this;
+        # the single-corpus path had not, which made every supervised run on a
+        # MiNT or social network wrong.
+        out["edge_index"], out["edge_weight"] = _remap_edges(
+            items, out["node_ids"], int(items[0]["num_nodes"]))
     else:
         out["x"] = torch.stack([it["x"] for it in items])       # [B, N, W, C]
     if items[0]["mask"] is not None:
@@ -276,7 +286,8 @@ def train_one(name: str, seed: int, epochs: int, batch_size: int, lr: float,
     with (contextlib.nullcontext(ckpt_dir) if keep else tempfile.TemporaryDirectory()) as d:
         best = ModelCheckpoint(dirpath=d, monitor="val_loss", mode="min", save_top_k=1,
                                filename=f"{name}-seed{seed}", enable_version_counter=False)
-        wb = wandb_logger(f"{name}-seed{seed}", group=f"sup-{name}", config=dict(
+        wb = wandb_logger(experiment_name("sup", seed, ckpt_dir, [name]),
+                          group=f"sup-{name}", config=dict(
             protocol="sup", corpora=[name], seed=seed, hidden=hidden, layers=layers,
             lr=lr, batch_size=batch_size, relations=relations, rel_gate=rel_gate,
             patch_len=patch_len, attn_depth=attn_depth, W=card.W, H=card.H,
@@ -295,6 +306,9 @@ def train_one(name: str, seed: int, epochs: int, batch_size: int, lr: float,
         # Score the best epoch, not the last one the stopper happened to reach.
         trainer.test(task, dl["test"], ckpt_path=best.best_model_path, verbose=False)
         val_loss = float(best.best_model_score) if best.best_model_score is not None else math.inf
+        # Inside the ckpt context: a run without --ckpt-dir keeps its weights in
+        # a TemporaryDirectory that is gone by the time we leave this block.
+        log_test(task.metrics, best.best_model_path)
     wandb_finish()
 
     row = {"dataset": name, "seed": seed, "metric": card.metric,

@@ -36,7 +36,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from shape.data import DatasetCard, ShapeDataset
 from shape.model import Shape, fusion_slot_masses, loss_for
-from shape.tracking import finish as wandb_finish, wandb_logger
+from shape.tracking import (finish as wandb_finish, wandb_logger,
+                            experiment_name, log_test)
 from shape.packs import collate_pack
 from shape.train import PRECISION, configure_backends, metrics_for
 
@@ -139,16 +140,48 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
 
     def __init__(self, dataset: MultiCorpus, batch: Dict[str, int],
                  cap: Optional[int] | Dict[str, int],
-                 shuffle: bool, generator: Optional[torch.Generator] = None):
+                 shuffle: bool, generator: Optional[torch.Generator] = None,
+                 nets: Optional[int] = None):
         self.dataset, self.batch, self.cap = dataset, batch, cap
-        self.shuffle, self.generator = shuffle, generator
+        self.shuffle, self.generator, self.nets = shuffle, generator, nets
+        self._deck: List[str] = []
         self._by_corpus: Dict[str, List[int]] = defaultdict(list)
         for flat, (name, _) in enumerate(dataset.index):
             self._by_corpus[name].append(flat)
 
+    def _names(self) -> List[str]:
+        """The corpora this epoch draws from.
+
+        ``nets`` bounds an epoch to a subset, so the cost of an epoch stops
+        growing with the size of the pack. The subset is dealt from a shuffled
+        deck that is only reshuffled once exhausted, rather than sampled
+        independently each epoch: drawing independently leaves a corpus unseen
+        with probability ``(1 - nets/k)**epochs``, which for 8-of-64 over 35
+        epochs is about 1% per corpus, and a pre-training corpus that is never
+        visited is the one outcome this must not have. Dealing guarantees every
+        corpus appears once per ``ceil(k/nets)`` epochs.
+
+        Only the shuffled (train) loader subsamples: validation must score the
+        same windows every epoch or early stopping compares two different
+        quantities.
+        """
+        names = list(self._by_corpus)
+        if not self.shuffle or not self.nets or self.nets >= len(names):
+            return names
+        out: List[str] = []
+        while len(out) < self.nets:
+            if not self._deck:
+                order = torch.randperm(len(names), generator=self.generator).tolist()
+                # a refilled deck must not hand back a corpus this epoch already
+                # holds, or that corpus silently takes a double share of it
+                self._deck = [names[i] for i in order if names[i] not in out]
+            out.append(self._deck.pop())
+        return out
+
     def _epoch(self) -> List[List[int]]:
         out: List[List[int]] = []
-        for name, flat in self._by_corpus.items():
+        for name in self._names():
+            flat = self._by_corpus[name]
             bs = self.batch.get(name, batch_for(name))
             if self.shuffle:
                 perm = torch.randperm(len(flat), generator=self.generator).tolist()
@@ -172,10 +205,14 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
         # Deterministic, and deliberately does NOT draw from the generator --
         # see phase_00 6.4(a), where HomogeneousBatchSampler.__len__ moved the
         # batch order every time the framework asked for a length.
+        n_corpora = len(self._by_corpus)
+        if self.shuffle and self.nets:
+            n_corpora = min(n_corpora, self.nets)
         if isinstance(self.cap, dict):
-            return sum(self.cap.get(n, 0) for n in self._by_corpus)
+            caps = sorted(self.cap.get(n, 0) for n in self._by_corpus)
+            return sum(caps[-n_corpora:]) if n_corpora < len(caps) else sum(caps)
         if self.cap is not None:
-            return self.cap * len(self._by_corpus)
+            return self.cap * n_corpora
         return sum(-(-len(v) // self.batch.get(n, batch_for(n)))
                    for n, v in self._by_corpus.items())
 
@@ -332,18 +369,21 @@ class PretrainTask(L.LightningModule):
         return torch.optim.Adam(params, lr=self.lr_, weight_decay=self.wd_)
 
 
-def loaders(names, fold_batch, cap, seed, root=None, num_workers=2, use_pe=False):
+def loaders(names, fold_batch, cap, seed, root=None, num_workers=2, use_pe=False,
+            val_cap=None, nets=None):
     out = {}
     for fold, shuffle in (("train", True), ("val", False), ("test", False)):
         ds = MultiCorpus(names, root=root, use_pe=use_pe).use_fold(fold)
         kw = dict(pin_memory=True)
         if num_workers:
             kw |= dict(num_workers=num_workers, persistent_workers=True, prefetch_factor=4)
+        # test is never capped: it is the number the paper reports.
+        fold_cap = cap if fold == "train" else (val_cap if fold == "val" else None)
         out[fold] = DataLoader(
             ds,
             batch_sampler=BalancedBatchSampler(
-                ds, fold_batch, cap if fold == "train" else None, shuffle,
-                torch.Generator().manual_seed(seed)),
+                ds, fold_batch, fold_cap, shuffle,
+                torch.Generator().manual_seed(seed), nets=nets),
             collate_fn=collate_pack,
             generator=torch.Generator().manual_seed(seed), **kw)
     return out, MultiCorpus(names, root=root, use_pe=use_pe).use_fold("train")
@@ -368,7 +408,8 @@ def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, la
              freeze_trunk=False, init_from=None, tag="joint",
              relations="gram+topo", batch=0, patch_len=12,
              domain_balance=False, covariates=False, rel_gate=True, attn_depth=2,
-             layer_agg=True, pe_readout=False, window_scales=()) -> Dict:
+             layer_agg=True, pe_readout=False, window_scales=(),
+             val_cap=0, nets=0) -> Dict:
     configure_backends(precision)
     L.seed_everything(seed, workers=True, verbose=False)
     run_dir = os.path.join(out_dir, tag, f"seed{seed}")
@@ -392,7 +433,12 @@ def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, la
               flush=True)
     else:
         caps = cap or None
-    dl, train_ds = loaders(names, fold_batch, caps, seed, root, num_workers, use_pe=pe_readout)
+    if nets and nets < len(names):
+        print(f"  sampling {nets} of {len(names)} corpora per epoch", flush=True)
+    if val_cap:
+        print(f"  validation capped at {val_cap} batches per corpus", flush=True)
+    dl, train_ds = loaders(names, fold_batch, caps, seed, root, num_workers,
+                           use_pe=pe_readout, val_cap=val_cap or None, nets=nets or None)
     task = PretrainTask(train_ds, base, lr, weight_decay, hidden, layers, eval_chunk,
                         freeze_trunk, relations, patch_len, use_covariates=covariates, rel_gate=rel_gate,
                         layer_agg=layer_agg, attn_depth=attn_depth, pe_readout=pe_readout,
@@ -409,7 +455,8 @@ def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, la
         torch.cuda.reset_peak_memory_stats(device)
     best = ModelCheckpoint(dirpath=run_dir, filename="best", monitor="val_macro",
                            mode="min", save_top_k=1, enable_version_counter=False)
-    wb = wandb_logger(f"{tag}-seed{seed}", group=tag, config=dict(
+    wb = wandb_logger(experiment_name("loo", seed, run_dir, names, tag),
+                      group=tag, config=dict(
         protocol="loo", corpora=list(names), n_corpora=len(names), seed=seed,
         hidden=hidden, layers=layers, lr=lr, cap=cap, relations=relations,
         rel_gate=rel_gate, patch_len=patch_len, attn_depth=attn_depth,
@@ -424,6 +471,7 @@ def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, la
     t0 = time.time()
     trainer.fit(task, dl["train"], dl["val"])
     trainer.test(task, dl["test"], ckpt_path=best.best_model_path, verbose=False)
+    log_test(task.metrics, best.best_model_path)
     wandb_finish()
 
     row = {"corpora": list(names), "n_corpora": len(names), "seed": seed, "tag": tag,
@@ -431,6 +479,7 @@ def pretrain(names, seed, out_dir, epochs, cap, lr, patience, device, hidden, la
            # A relation whose branch stayed dead leaves its slot at exact zero.
            "fusion_slots": fusion_slot_masses(task.model),
            "epochs_run": trainer.current_epoch, "cap": cap,
+           "val_cap": val_cap, "nets_per_epoch": nets,
            "val_macro": float(best.best_model_score) if best.best_model_score is not None else float("nan"),
            "checkpoint": best.best_model_path, "baselines": base, "batch": fold_batch,
            "hidden": hidden, "layers": layers, "lr": lr, "weight_decay": weight_decay,
@@ -466,6 +515,13 @@ if __name__ == "__main__":
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--cap", type=int, default=64,  # 0 = full proportional pass
                     help="batches drawn from EVERY corpus each epoch (balanced exposure)")
+    ap.add_argument("--val-cap", type=int, default=0,
+                    help="validation batches per corpus, 0 = every window. The "
+                         "test fold is never capped.")
+    ap.add_argument("--nets-per-epoch", type=int, default=0,
+                    help="draw each epoch from this many corpora, resampled every "
+                         "epoch, 0 = all of them. Fixes the cost of an epoch "
+                         "independently of how large the pack is.")
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--window-scales", type=int, nargs="*", default=[],
@@ -521,7 +577,7 @@ if __name__ == "__main__":
                      a.num_workers, a.eval_chunk, a.freeze_trunk, a.init_from, a.tag,
                      a.relations, a.batch, a.patch_len, a.domain_balance, a.covariates,
                      a.rel_gate, a.attn_depth, a.layer_agg, a.pe_readout,
-                     a.window_scales)
+                     a.window_scales, a.val_cap, a.nets_per_epoch)
         print(f"\n{a.tag} seed{seed}  val_macro {r['val_macro']:.4f}  "
               f"{r['epochs_run']} ep  {r['seconds']:.0f}s", flush=True)
         for n, m in r["metrics"].items():
